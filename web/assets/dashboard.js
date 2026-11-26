@@ -551,6 +551,7 @@
     for (const btn of rangeButtons) {
       btn.setAttribute("aria-pressed", String(btn.dataset.range === state.range));
     }
+    byId("topbar-range-select").value = state.range;
     const label = rangeLabel(state.range);
     const usageBadge = byId("usage-range-badge");
     const accessKeysBadge = byId("access-keys-range-badge");
@@ -611,7 +612,6 @@
     const sectionEl = byId("section-access-keys");
     const countBadgeEl = byId("access-keys-count-badge");
     const metaEl = byId("access-keys-meta");
-    const caveatsEl = byId("access-keys-caveats");
     const emptyEl = byId("access-keys-empty");
     const scrollEl = byId("access-keys-scroll");
     const bodyEl = byId("access-keys-body");
@@ -649,7 +649,6 @@
     clearChildren(bodyEl);
 
     if (!data) {
-      if (caveatsEl) caveatsEl.hidden = true;
       if (emptyEl) {
         emptyEl.textContent = akState.error ? "暂无可用 AccessKey 统计数据" : `正在加载${rangeLabel(activeRange)} AccessKey 统计…`;
         emptyEl.hidden = false;
@@ -660,7 +659,6 @@
     }
 
     if (items.length === 0) {
-      if (caveatsEl) caveatsEl.hidden = true;
       if (emptyEl) {
         emptyEl.textContent = "该时间范围内暂无 AccessKey 统计记录";
         emptyEl.hidden = false;
@@ -673,18 +671,11 @@
     if (emptyEl) emptyEl.hidden = true;
     if (scrollEl) scrollEl.hidden = false;
 
-    let incompleteCount = 0;
-    let rowErrorCount = 0;
-
     for (const item of items) {
       if (!item || typeof item !== "object") continue;
 
       const nameText = getAccessKeyDisplayName(item);
-      const pricingIncomplete = Boolean(item.pricing_incomplete);
       const rowError = item.error ? String(item.error).trim() : "";
-
-      if (pricingIncomplete) incompleteCount++;
-      if (rowError) rowErrorCount++;
 
       const nameRowChildren = [
         createEl("span", {
@@ -695,15 +686,6 @@
       ];
       if (item.deleted) {
         nameRowChildren.push(createEl("span", { className: "badge badge--neutral", text: "已删除" }));
-      }
-      if (pricingIncomplete) {
-        nameRowChildren.push(
-          createEl("span", {
-            className: "badge badge--warn",
-            text: "计价不全",
-            attrs: { title: "部分请求缺少模型定价，费用指标可能不完整" },
-          })
-        );
       }
       if (rowError) {
         nameRowChildren.push(
@@ -756,22 +738,6 @@
       bodyEl.appendChild(tr);
     }
     sortAccessKeyRows();
-
-    if (caveatsEl) {
-      const notes = [];
-      if (incompleteCount > 0) {
-        notes.push(`${incompleteCount} 个 AccessKey 存在未计价或部分计价请求，费用指标可能偏低`);
-      }
-      if (rowErrorCount > 0) {
-        notes.push(`${rowErrorCount} 个 AccessKey 统计异常`);
-      }
-      if (notes.length > 0) {
-        caveatsEl.textContent = `统计提示：${notes.join("；")}。`;
-        caveatsEl.hidden = false;
-      } else {
-        caveatsEl.hidden = true;
-      }
-    }
 
     renderAccessKeyTrendSection(activeRange, akState);
   }
@@ -1045,8 +1011,6 @@
     const tokEl = byId("usage-total-tokens");
     const tokSubEl = byId("usage-tokens-sub");
     const costEl = byId("usage-cost");
-    const costSubEl = byId("usage-cost-sub");
-    const caveatsEl = byId("usage-caveats");
     const winLabelEl = byId("usage-window-label");
 
     if (summary) {
@@ -1072,29 +1036,6 @@
       }
 
       if (costEl) costEl.textContent = formatUsdFromNano(summary.estimated_cost_nano_usd);
-      if (costSubEl) {
-        const unpriced = toFiniteNum(summary.unpriced_request_count) || 0;
-        const partial = toFiniteNum(summary.pricing_partial_count) || 0;
-        costSubEl.textContent = unpriced > 0 || partial > 0
-          ? "存在未计价或部分计价请求"
-          : "按模型定价估算（USD）";
-      }
-
-      if (caveatsEl) {
-        const caveats = [];
-        const unpriced = toFiniteNum(summary.unpriced_request_count) || 0;
-        const partial = toFiniteNum(summary.pricing_partial_count) || 0;
-        const missing = toFiniteNum(summary.usage_missing_count) || 0;
-        if (unpriced > 0) caveats.push(`${formatInt(unpriced)} 次未计价`);
-        if (partial > 0) caveats.push(`${formatInt(partial)} 次部分计价`);
-        if (missing > 0) caveats.push(`${formatInt(missing)} 次缺失用量`);
-        if (caveats.length > 0) {
-          caveatsEl.textContent = `计价与统计提示：包含 ${caveats.join("、")}。`;
-          caveatsEl.hidden = false;
-        } else {
-          caveatsEl.hidden = true;
-        }
-      }
     } else {
       if (reqEl) reqEl.textContent = "—";
       if (reqSubEl) reqSubEl.textContent = "成功 — / 失败 —";
@@ -1103,8 +1044,6 @@
       if (tokEl) tokEl.textContent = "—";
       if (tokSubEl) tokSubEl.textContent = "输入 — / 缓存读取 —";
       if (costEl) costEl.textContent = "—";
-      if (costSubEl) costSubEl.textContent = "美元估算值";
-      if (caveatsEl) caveatsEl.hidden = true;
     }
 
     const granularity = data && data.granularity ? String(data.granularity) : "";
@@ -1315,7 +1254,6 @@
       if (data && toFiniteNum(data.observed_at_ms)) {
         parts.push(`上游观测 ${formatLocalDateTime(data.observed_at_ms)}`);
       }
-      if (items.length > 0) parts.push("金额按 GPT-Load 已计价用量估算");
       metaEl.textContent = parts.length > 0 ? parts.join("  |  ") : (state.isLoading ? "加载中…" : "暂无更新时间");
     }
 
@@ -1485,7 +1423,6 @@
     const safeLevelPercent = toFiniteNum(win.safe_level_percent);
     const safeAmountUsd = toFiniteNum(win.safe_amount_usd);
     const aheadAmountUsd = toFiniteNum(win.ahead_amount_usd);
-    const pricingIncomplete = Boolean(win.pricing_incomplete);
 
     const limitLabel = isWeeklyQuotaWindow(win) ? "预估周额度" : "预估额度";
     const isOverSafeLine = Boolean(
@@ -1550,15 +1487,6 @@
     const titleGroupChildren = [
       createEl("span", { className: "quota-window-label", text: titleText }),
     ];
-    if (pricingIncomplete) {
-      titleGroupChildren.push(
-        createEl("span", {
-          className: "badge badge--warn",
-          text: "计价不全",
-          attrs: { title: "部分请求缺少定价，估算金额可能不完整" },
-        })
-      );
-    }
 
     const metricsGrid = createEl("div", { className: "quota-window-metrics" }, [
       buildQuotaStatCell("已用金额", formatUsdFixed2(usedAmountUsd), "quota-stat--primary"),
@@ -1955,8 +1883,7 @@
 
   function formatAccessKeyTrendPoint(metric, point) {
     const value = point?.value;
-    const text = value == null ? "无数据" : ACCESS_KEY_TREND_METRICS[metric].format(value);
-    return point?.pricingIncomplete ? `${text}（计价不全）` : text;
+    return value == null ? "无数据" : ACCESS_KEY_TREND_METRICS[metric].format(value);
   }
 
   function getAccessKeyTrendCeiling(metric, series) {
@@ -1992,7 +1919,7 @@
         const value = read(pt);
         const pricingIncomplete = metric === "cost" && pt.pricing_incomplete === true;
         if (value !== null || pricingIncomplete) hasValidPoint = true;
-        pointsByStart.set(startMs, { value, pricingIncomplete });
+        pointsByStart.set(startMs, { value });
         rowBuckets.push({ startMs, endMs });
       }
 
@@ -2760,6 +2687,9 @@
         selectRange(btn.dataset.range, true);
       });
     }
+    byId("topbar-range-select").addEventListener("change", (event) => {
+      selectRange(event.currentTarget.value, true);
+    });
     if (refreshBtn) {
       refreshBtn.addEventListener("click", function () {
         scheduleAutoRefresh();

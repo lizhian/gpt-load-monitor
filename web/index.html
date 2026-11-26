@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="GPT-Load 只读运维监控台，展示订阅额度、AccessKey 统计、服务健康与用量趋势。">
   <title>GPT-Load 监控台</title>
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/styles.css">
   <script defer src="assets/dashboard.js"></script>
 </head>
@@ -70,9 +71,21 @@
             aria-pressed="false"
           >近 30 天</button>
         </div>
+        <div class="topbar-range-field">
+          <select id="topbar-range-select" class="btn topbar-range-select" aria-label="统计时间范围">
+            <option value="6h">近 6 小时</option>
+            <option value="12h">近 12 小时</option>
+            <option value="24h" selected>近 24 小时</option>
+            <option value="today">今天</option>
+            <option value="yesterday">昨天</option>
+            <option value="7d">近 7 天</option>
+            <option value="30d">近 30 天</option>
+          </select>
+        </div>
 
         <div class="topbar-actions">
-          <button type="button" class="btn btn--primary" id="refresh-btn">刷新</button>
+          <button type="button" class="btn btn--outline" id="refresh-btn">刷新</button>
+          <a class="btn btn--primary" href="{{.MainSiteURL}}">主站</a>
 
           <form class="logout-form" method="post" action="/logout">
             <button type="submit" class="btn btn--outline">退出</button>
@@ -119,7 +132,6 @@
       </div>
 
       <div class="alert alert--warn" id="access-keys-error" role="alert" hidden></div>
-      <p class="caveat-note" id="access-keys-caveats" hidden></p>
 
       <div class="empty-state" id="access-keys-empty">正在加载 AccessKey 统计…</div>
 
@@ -166,7 +178,10 @@
 
       <div class="chart-panel" id="access-keys-trend-chart-panel">
         <div class="chart-header">
-          <h3 class="subpanel-title" id="heading-access-keys-trend-chart">用量趋势</h3>
+          <div class="chart-title-block">
+            <h3 class="subpanel-title" id="heading-access-keys-trend-chart">用量趋势</h3>
+            <span class="chart-window measured" id="access-keys-trend-window-label">--</span>
+          </div>
           <div id="access-keys-trend-metrics" class="range-group" role="group" aria-label="用量趋势指标">
             <button class="btn btn--segment btn--sm" type="button" data-metric="requests" aria-pressed="false">请求数</button>
             <button class="btn btn--segment btn--sm" type="button" data-metric="tokens" aria-pressed="false">Token 用量</button>
@@ -174,7 +189,6 @@
             <button class="btn btn--segment btn--sm" type="button" data-metric="cost" aria-pressed="true">估算费用</button>
           </div>
         </div>
-        <span class="chart-window measured" id="access-keys-trend-window-label">--</span>
         <span class="visually-hidden" id="access-keys-trend-selected-metric">估算费用</span>
 
         <div
@@ -328,11 +342,9 @@
         <div class="metric-cell">
           <span class="metric-label">估算费用</span>
           <div class="metric-primary measured" id="usage-cost">--</div>
-          <div class="metric-sub" id="usage-cost-sub">美元估算值</div>
+          <div class="metric-sub">美元估算值</div>
         </div>
       </div>
-
-      <p class="caveat-note" id="usage-caveats" hidden></p>
 
       <!-- 请求趋势图 -->
       <div class="chart-panel">

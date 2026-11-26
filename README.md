@@ -27,7 +27,7 @@ Compose 默认绑定 `127.0.0.1:8080`，可用 `DASHBOARD_PORT` 调整宿主机�
 
 | 变量 | 用途 |
 | --- | --- |
-| `GPT_LOAD_BASE_URL` | GPT-Load 服务地址，例如 `https://gpt-load.example.com` |
+| `GPT_LOAD_BASE_URL` | GPT-Load 服务地址，也用于面板的「主站」链接，例如 `https://gpt-load.example.com` |
 | `GPT_LOAD_AUTH_KEY` | 仅由 Go 服务读取，用于调用 GPT-Load 管理接口 |
 | `VIEWER_PASSWORD` | 看板的共享登录密码 |
 | `SESSION_SECRET` | 保存查看会话的签名密钥，至少 32 个字符 |
@@ -38,8 +38,8 @@ AccessKey 和整体用量共用顶部时间筛选，支持近 6 小时、近 12 
 
 AccessKey 统计包含当前启用和停用的 Key，以及 GPT-Load 在所选范围的用量分布中返回的已删除 Key。
 
-AccessKey 用量趋势默认显示估算费用，也可切换到请求数、Token 用量和缓存率。点击图例可显示或隐藏曲线，分桶明细会标记计价不全的费用。
+AccessKey 用量趋势默认显示估算费用，也可切换到请求数、Token 用量和缓存率。点击图例可显示或隐藏曲线。
 
-订阅额度以 GPT-Load 最近一次观测的快照为准。美元额度按同一周期内、可归属于账号的已计价消耗估算，计价缺失会在页面提示。倒计时到期时，剩余额度仍以上游下一次观测为准。
+订阅额度以 GPT-Load 最近一次观测的快照为准。美元额度按同一周期内、可归属于账号的已计价消耗估算。倒计时到期时，剩余额度仍以上游下一次观测为准。
 
 运行 `go test ./...` 验证登录保护、上游部分失败处理、北京时间日界和额度及 AccessKey 计算。

@@ -85,6 +85,10 @@ func TestDashboardAccessAndPartialFailure(t *testing.T) {
 		t.Fatalf("login did not establish a secure session: status %d", w.Code)
 	}
 	cookie := cookies[0]
+	page := request(http.MethodGet, "/", "", cookie)
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), `href="`+upstream.URL+`">主站</a>`) || strings.Contains(page.Body.String(), upstreamKey) {
+		t.Fatal("dashboard should link to the configured upstream without exposing its key")
+	}
 	if w := request(http.MethodGet, "/api/dashboard?range=day", "", cookie); w.Code != http.StatusBadRequest {
 		t.Fatalf("invalid range: status %d", w.Code)
 	}

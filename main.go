@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"embed"
@@ -99,8 +100,9 @@ func newHandler(cfg config, now func() time.Time) http.Handler {
 	if err != nil {
 		panic(err)
 	}
-	indexPage, err := web.ReadFile("web/index.html")
-	if err != nil {
+	var indexPage bytes.Buffer
+	indexTemplate := template.Must(template.ParseFS(web, "web/index.html"))
+	if err := indexTemplate.ExecuteTemplate(&indexPage, "index.html", struct{ MainSiteURL string }{cfg.baseURL}); err != nil {
 		panic(err)
 	}
 	app := &app{
@@ -117,7 +119,7 @@ func newHandler(cfg config, now func() time.Time) http.Handler {
 			},
 		},
 		loginPage:    template.Must(template.ParseFS(web, "web/login.html")),
-		indexPage:    indexPage,
+		indexPage:    indexPage.Bytes(),
 		password:     sha256.Sum256([]byte(cfg.password)),
 		sessionKey:   []byte(cfg.sessionKey),
 		secureCookie: cfg.secureCookie,
