@@ -147,7 +147,7 @@ input {
 }
 
 .skip-link {
-  position: absolute;
+  position: fixed;
   inset-inline-start: var(--space-md);
   inset-block-start: var(--space-xs);
   z-index: 100;
@@ -495,7 +495,14 @@ input {
    Dashboard Header
    ========================================================================== */
 
+html {
+  scroll-padding-top: var(--topbar-height, 0px);
+}
+
 .topbar {
+  position: sticky;
+  top: 0;
+  z-index: 4;
   background-color: var(--color-paper);
   color: var(--color-ink);
   border-bottom: var(--rule-hair) solid var(--color-rule);

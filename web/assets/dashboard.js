@@ -3020,6 +3020,17 @@
      ------------------------------------------------------------------------ */
 
   function init() {
+    const topbar = document.querySelector(".topbar");
+    const updateTopbarHeight = () => {
+      document.documentElement.style.setProperty("--topbar-height", `${topbar.offsetHeight}px`);
+    };
+    updateTopbarHeight();
+    if (typeof ResizeObserver === "function") {
+      new ResizeObserver(updateTopbarHeight).observe(topbar);
+    } else {
+      window.addEventListener("resize", updateTopbarHeight);
+    }
+
     state.range = readRangeFromUrl();
     syncRangeToUrl(state.range, false);
     updateRangeControls();
