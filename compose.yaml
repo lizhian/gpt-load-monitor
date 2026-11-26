@@ -1,0 +1,13 @@
+services:
+  dashboard:
+    image: ghcr.io/lizhian/gpt-load-monitor:latest
+    build: .
+    restart: unless-stopped
+    environment:
+      GPT_LOAD_BASE_URL: ${GPT_LOAD_BASE_URL:?set GPT_LOAD_BASE_URL in .env}
+      GPT_LOAD_AUTH_KEY: ${GPT_LOAD_AUTH_KEY:?set GPT_LOAD_AUTH_KEY in .env}
+      VIEWER_PASSWORD: ${VIEWER_PASSWORD:?set VIEWER_PASSWORD in .env}
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+    ports:
+      - "127.0.0.1:${DASHBOARD_PORT:-8080}:8080"

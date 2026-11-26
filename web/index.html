@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="GPT-Load 只读运维监控台，展示订阅额度、AccessKey 统计、服务健康与用量趋势。">
+  <title>GPT-Load 监控台</title>
+  <link rel="stylesheet" href="assets/styles.css">
+  <script defer src="assets/dashboard.js"></script>
+</head>
+<body class="page-dashboard">
+  <a class="skip-link" href="#main-content">跳至主要内容</a>
+
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <div class="brand-group">
+        <h1 class="brand-title">GPT-Load 监控台</h1>
+        <p class="sync-status" id="global-sync-status" aria-live="polite">正在初始化监控数据…</p>
+      </div>
+
+      <div class="topbar-controls">
+        <div class="range-group" role="group" aria-label="统计时间范围">
+          <button
+            type="button"
+            class="btn btn--segment"
+            id="range-24h"
+            data-range="24h"
+            aria-pressed="true"
+          >近 24 小时</button>
+          <button
+            type="button"
+            class="btn btn--segment"
+            id="range-today"
+            data-range="today"
+            aria-pressed="false"
+          >今天</button>
+          <button
+            type="button"
+            class="btn btn--segment"
+            id="range-yesterday"
+            data-range="yesterday"
+            aria-pressed="false"
+          >昨天</button>
+          <button
+            type="button"
+            class="btn btn--segment"
+            id="range-7d"
+            data-range="7d"
+            aria-pressed="false"
+          >近 7 天</button>
+          <button
+            type="button"
+            class="btn btn--segment"
+            id="range-30d"
+            data-range="30d"
+            aria-pressed="false"
+          >近 30 天</button>
+        </div>
+
+        <div class="topbar-actions">
+          <button type="button" class="btn btn--primary" id="refresh-btn">刷新</button>
+
+          <form class="logout-form" method="post" action="/logout">
+            <button type="submit" class="btn btn--outline">退出</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main id="main-content" class="container dashboard-main">
+    <noscript>
+      <div class="alert alert--error" role="alert">
+        <p class="alert-text">需要启用浏览器 JavaScript 才能加载实时监控数据。</p>
+      </div>
+    </noscript>
+
+    <div class="alert alert--error" id="global-error-banner" role="alert" hidden></div>
+
+    <!-- 1. 订阅额度 -->
+    <section class="panel-section" id="section-quota" aria-labelledby="heading-quota" aria-busy="true">
+      <div class="section-header">
+        <div class="section-heading-group">
+          <h2 id="heading-quota" class="section-title">订阅额度</h2>
+          <span class="badge badge--neutral measured" id="quota-count-badge">0 项</span>
+        </div>
+        <div class="section-meta" id="quota-meta">等待数据</div>
+      </div>
+
+      <div class="alert alert--warn" id="quota-error" role="alert" hidden></div>
+
+      <div class="empty-state" id="quota-empty">正在加载订阅额度…</div>
+      <div class="quota-grid" id="quota-list" hidden></div>
+    </section>
+
+    <!-- 2. AccessKey 统计 -->
+    <section class="panel-section" id="section-access-keys" aria-labelledby="heading-access-keys" aria-busy="true">
+      <div class="section-header">
+        <div class="section-heading-group">
+          <h2 id="heading-access-keys" class="section-title">AccessKey 统计</h2>
+          <span class="badge badge--accent" id="access-keys-range-badge">近 24 小时</span>
+          <span class="badge badge--neutral measured" id="access-keys-count-badge">0 项</span>
+        </div>
+        <div class="section-meta" id="access-keys-meta">等待数据</div>
+      </div>
+
+      <div class="alert alert--warn" id="access-keys-error" role="alert" hidden></div>
+      <p class="caveat-note" id="access-keys-caveats" hidden></p>
+
+      <div class="empty-state" id="access-keys-empty">正在加载 AccessKey 统计…</div>
+
+      <div
+        class="table-scroll"
+        id="access-keys-scroll"
+        role="region"
+        aria-labelledby="heading-access-keys"
+        tabindex="0"
+        hidden
+      >
+        <table class="data-table data-table--access-keys" id="access-keys-table">
+          <caption class="visually-hidden">AccessKey 统计</caption>
+          <thead>
+            <tr>
+              <th scope="col" class="col-sticky">AccessKey</th>
+              <th scope="col" class="num" aria-sort="descending">
+                <button type="button" commandfor="access-keys-table" command="--sort">总消费 <span aria-hidden="true"></span></button>
+              </th>
+              <th scope="col" class="num">
+                <button type="button" commandfor="access-keys-table" command="--sort">总 Token <span aria-hidden="true"></span></button>
+              </th>
+              <th scope="col" class="num">
+                <button type="button" commandfor="access-keys-table" command="--sort">总请求 <span aria-hidden="true"></span></button>
+              </th>
+              <th scope="col" class="num">
+                <button type="button" commandfor="access-keys-table" command="--sort">缓存命中率 <span aria-hidden="true"></span></button>
+              </th>
+              <th scope="col" class="num">
+                <button type="button" commandfor="access-keys-table" command="--sort">每百万 Token 消费 <span aria-hidden="true"></span></button>
+              </th>
+              <th scope="col" class="num">
+                <button type="button" commandfor="access-keys-table" command="--sort">每千请求消费 <span aria-hidden="true"></span></button>
+              </th>
+              <th scope="col" class="num">
+                <button type="button" commandfor="access-keys-table" command="--sort">每请求 Token <span aria-hidden="true"></span></button>
+              </th>
+            </tr>
+          </thead>
+          <tbody id="access-keys-body"></tbody>
+        </table>
+      </div>
+      <p class="visually-hidden" role="status" id="access-key-sort-status"></p>
+    </section>
+
+    <!-- 3. 服务健康 -->
+    <section class="panel-section" id="section-health" aria-labelledby="heading-health" aria-busy="true">
+      <div class="section-header">
+        <div class="section-heading-group">
+          <h2 id="heading-health" class="section-title">服务健康</h2>
+          <span class="badge badge--neutral" id="health-reachability">检查中</span>
+        </div>
+        <div class="section-meta" id="health-meta">等待数据</div>
+      </div>
+
+      <div class="alert alert--warn" id="health-error" role="alert" hidden></div>
+      <div class="alert alert--warn" id="concurrency-error" role="alert" hidden></div>
+
+      <div class="hairline-grid health-metrics-grid" id="health-summary-grid">
+        <div class="metric-cell">
+          <span class="metric-label">服务版本与运行时间</span>
+          <div class="metric-primary measured" id="health-version">--</div>
+          <div class="metric-sub measured" id="health-uptime">运行时间 --</div>
+        </div>
+
+        <div class="metric-cell">
+          <span class="metric-label">当前并发</span>
+          <div class="metric-primary measured" id="concurrency-reading">--</div>
+          <div class="metric-sub" id="concurrency-sub">等待并发数据</div>
+        </div>
+
+        <div class="metric-cell">
+          <span class="metric-label">可用凭证</span>
+          <div class="metric-primary measured" id="health-available">--</div>
+          <div class="metric-sub measured" id="health-total-creds">总凭证 --</div>
+        </div>
+
+        <div class="metric-cell">
+          <span class="metric-label">冷却与拉黑</span>
+          <div class="metric-primary measured" id="health-degraded">--</div>
+          <div class="metric-sub measured" id="health-degraded-detail">冷却 -- / 拉黑 --</div>
+        </div>
+      </div>
+
+      <div class="subpanel">
+        <div class="subpanel-bar">
+          <h3 class="subpanel-title" id="heading-health-groups">分组凭证状态</h3>
+          <span class="subpanel-meta measured" id="health-groups-count">0 个分组</span>
+        </div>
+
+        <div class="empty-state" id="health-groups-empty">正在加载分组状态…</div>
+
+        <div
+          class="table-scroll table-scroll--compact"
+          id="health-groups-scroll"
+          role="region"
+          aria-labelledby="heading-health-groups"
+          tabindex="0"
+          hidden
+        >
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th scope="col" class="col-sticky">分组名称</th>
+                <th scope="col">启用状态</th>
+                <th scope="col" class="num">凭证总数</th>
+                <th scope="col" class="num">可用</th>
+                <th scope="col" class="num">冷却</th>
+                <th scope="col" class="num">模型冷却</th>
+                <th scope="col" class="num">拉黑</th>
+              </tr>
+            </thead>
+            <tbody id="health-groups-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 4. 用量统计 -->
+    <section class="panel-section" id="section-usage" aria-labelledby="heading-usage" aria-busy="true">
+      <div class="section-header">
+        <div class="section-heading-group">
+          <h2 id="heading-usage" class="section-title">用量统计</h2>
+          <span class="badge badge--accent" id="usage-range-badge">近 24 小时</span>
+        </div>
+        <div class="section-meta" id="usage-meta">等待数据</div>
+      </div>
+
+      <div class="alert alert--warn" id="usage-error" role="alert" hidden></div>
+
+      <div class="hairline-grid usage-metrics-grid" id="usage-summary-grid">
+        <div class="metric-cell metric-cell--hero">
+          <span class="metric-label">总请求数</span>
+          <div class="reading" id="usage-requests">--</div>
+          <div class="metric-sub measured" id="usage-requests-sub">成功 -- / 失败 --</div>
+        </div>
+
+        <div class="metric-cell">
+          <span class="metric-label">成功率</span>
+          <div class="metric-primary measured" id="usage-success-rate">--</div>
+          <div class="metric-sub" id="usage-success-sub">基于总请求计算</div>
+        </div>
+
+        <div class="metric-cell">
+          <span class="metric-label">总 Token</span>
+          <div class="metric-primary measured" id="usage-total-tokens">--</div>
+          <div class="metric-sub measured" id="usage-tokens-sub">输入 -- / 缓存读取 --</div>
+        </div>
+
+        <div class="metric-cell">
+          <span class="metric-label">估算费用</span>
+          <div class="metric-primary measured" id="usage-cost">--</div>
+          <div class="metric-sub" id="usage-cost-sub">美元估算值</div>
+        </div>
+      </div>
+
+      <p class="caveat-note" id="usage-caveats" hidden></p>
+
+      <!-- 请求趋势图 -->
+      <div class="chart-panel">
+        <div class="chart-header">
+          <div class="chart-title-block">
+            <h3 class="subpanel-title" id="heading-usage-chart">请求趋势</h3>
+            <span class="chart-window measured" id="usage-window-label">--</span>
+          </div>
+          <div class="chart-legend" aria-label="图例">
+            <span class="legend-item">
+              <span class="legend-swatch legend-swatch--total" aria-hidden="true"></span>
+              <span>总请求</span>
+            </span>
+            <span class="legend-item">
+              <span class="legend-swatch legend-swatch--failure" aria-hidden="true"></span>
+              <span>失败请求</span>
+            </span>
+          </div>
+        </div>
+
+        <div class="chart-inspect" id="usage-chart-inspect" aria-live="polite">
+          移动指针或聚焦图表按左右方向键查看各时间分桶明细。
+        </div>
+
+        <div class="chart-stage" id="usage-chart-stage">
+          <canvas
+            id="usage-trend-canvas"
+            class="trend-canvas"
+            role="img"
+            aria-labelledby="heading-usage-chart"
+            aria-describedby="usage-chart-inspect"
+            tabindex="0"
+          ></canvas>
+          <div class="empty-state chart-empty" id="usage-chart-empty" hidden>暂无请求趋势数据</div>
+        </div>
+
+        <details class="bucket-details" id="usage-bucket-details">
+          <summary class="bucket-summary">查看分桶数值明细</summary>
+          <div
+            class="table-scroll table-scroll--compact"
+            role="region"
+            aria-label="请求趋势分桶明细表"
+            tabindex="0"
+          >
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th scope="col" class="col-sticky">时间段</th>
+                  <th scope="col" class="num">总请求</th>
+                  <th scope="col" class="num">失败请求</th>
+                  <th scope="col" class="num">成功率</th>
+                </tr>
+              </thead>
+              <tbody id="usage-buckets-body"></tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <!-- 用量排行 -->
+      <div class="subpanel rankings-panel">
+        <div class="subpanel-bar rankings-bar">
+          <h3 class="subpanel-title" id="heading-usage-rankings">用量排行</h3>
+          <div class="tab-list" role="tablist" aria-labelledby="heading-usage-rankings">
+            <button
+              type="button"
+              role="tab"
+              class="tab-btn"
+              id="tab-models"
+              aria-selected="true"
+              aria-controls="panel-models"
+              data-rank-tab="models"
+            >模型 <span class="tab-count measured" id="count-models">0</span></button>
+            <button
+              type="button"
+              role="tab"
+              class="tab-btn"
+              id="tab-groups"
+              aria-selected="false"
+              aria-controls="panel-groups"
+              data-rank-tab="groups"
+            >分组 <span class="tab-count measured" id="count-groups">0</span></button>
+          </div>
+        </div>
+
+        <div id="panel-models" class="rank-tabpanel" role="tabpanel" aria-labelledby="tab-models">
+          <div class="empty-state" id="rank-models-empty">正在加载模型排行…</div>
+          <div class="table-scroll" id="rank-models-scroll" role="region" aria-label="模型用量排行" tabindex="0" hidden>
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th scope="col" class="col-sticky">模型</th>
+                  <th scope="col" class="num">请求数</th>
+                  <th scope="col" class="num">总 Token</th>
+                  <th scope="col" class="num">估算费用</th>
+                </tr>
+              </thead>
+              <tbody id="rank-models-body"></tbody>
+            </table>
+          </div>
+          <div class="rank-footer" id="rank-models-footer" hidden>
+            <button type="button" class="btn btn--outline btn--sm" data-rank-expand="models">展开全部</button>
+          </div>
+        </div>
+
+        <div id="panel-groups" class="rank-tabpanel" role="tabpanel" aria-labelledby="tab-groups" hidden>
+          <div class="empty-state" id="rank-groups-empty">正在加载分组排行…</div>
+          <div class="table-scroll" id="rank-groups-scroll" role="region" aria-label="分组用量排行" tabindex="0" hidden>
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th scope="col" class="col-sticky">分组</th>
+                  <th scope="col" class="num">请求数</th>
+                  <th scope="col" class="num">总 Token</th>
+                  <th scope="col" class="num">估算费用</th>
+                </tr>
+              </thead>
+              <tbody id="rank-groups-body"></tbody>
+            </table>
+          </div>
+          <div class="rank-footer" id="rank-groups-footer" hidden>
+            <button type="button" class="btn btn--outline btn--sm" data-rank-expand="groups">展开全部</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
