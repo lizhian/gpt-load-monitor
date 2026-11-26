@@ -37,32 +37,45 @@ func selectedUsageSpan(period string, now time.Time) usageSpan {
 
 type usageSummary struct {
 	rankingTotals
+	cacheTokens
 	Success        int64 `json:"success_count"`
 	Failure        int64 `json:"failure_count"`
-	UncachedInput  int64 `json:"uncached_input_tokens"`
-	CacheRead      int64 `json:"cache_read_tokens"`
-	CacheWrite5m   int64 `json:"cache_write_5m_tokens"`
-	CacheWrite1h   int64 `json:"cache_write_1h_tokens"`
-	CacheWriteElse int64 `json:"cache_write_unknown_tokens"`
 	Unpriced       int64 `json:"unpriced_request_count"`
 	PartialPricing int64 `json:"pricing_partial_count"`
 	MissingUsage   int64 `json:"usage_missing_count"`
 }
 
-func (s usageSummary) promptTokens() int64 {
+type cacheTokens struct {
+	UncachedInput  int64 `json:"uncached_input_tokens"`
+	CacheRead      int64 `json:"cache_read_tokens"`
+	CacheWrite5m   int64 `json:"cache_write_5m_tokens"`
+	CacheWrite1h   int64 `json:"cache_write_1h_tokens"`
+	CacheWriteElse int64 `json:"cache_write_unknown_tokens"`
+}
+
+func (s cacheTokens) promptTokens() int64 {
 	return s.UncachedInput + s.CacheRead + s.CacheWrite5m + s.CacheWrite1h + s.CacheWriteElse
+}
+
+func (s cacheTokens) cacheHitRate() *float64 {
+	return divided(float64(s.CacheRead), s.promptTokens())
 }
 
 func (s usageSummary) incomplete() bool {
 	return s.Unpriced > 0 || s.PartialPricing > 0 || s.MissingUsage > 0
 }
 
+type usageReportBucket struct {
+	usageBucket
+	cacheTokens
+}
+
 type usageReport struct {
-	Granularity  string        `json:"granularity"`
-	BucketWidth  int64         `json:"bucket_width_ms"`
-	ObservedAt   int64         `json:"observed_at_ms"`
-	Summary      usageSummary  `json:"summary"`
-	Series       []usageBucket `json:"series"`
+	Granularity  string              `json:"granularity"`
+	BucketWidth  int64               `json:"bucket_width_ms"`
+	ObservedAt   int64               `json:"observed_at_ms"`
+	Summary      usageSummary        `json:"summary"`
+	Series       []usageReportBucket `json:"series"`
 	Distribution struct {
 		Model struct {
 			Requests struct{ Items []modelRanking } `json:"requests"`
@@ -110,7 +123,7 @@ func (u upstream) readUsage(ctx context.Context, span usageSpan, filters url.Val
 func (r usageReport) dashboardUsage(period string, span usageSpan, health *healthData) usageData {
 	result := usageData{
 		Range: period, Granularity: r.Granularity, From: span.from, To: span.to,
-		ObservedAt: r.ObservedAt, Series: r.Series,
+		ObservedAt: r.ObservedAt,
 	}
 	result.Summary.usageSummary = r.Summary
 	result.Summary.InputTokens = r.Summary.promptTokens()
@@ -129,23 +142,26 @@ func (r usageReport) dashboardUsage(period string, span usageSpan, health *healt
 		}
 		result.Rankings.Groups = append(result.Rankings.Groups, row)
 	}
-	if r.BucketWidth > 0 && span.to > span.from {
-		result.Series = r.fillBuckets(span)
+	for _, bucket := range r.fillBuckets(span) {
+		result.Series = append(result.Series, bucket.usageBucket)
 	}
 	return result
 }
 
-func (r usageReport) fillBuckets(span usageSpan) []usageBucket {
+func (r usageReport) fillBuckets(span usageSpan) []usageReportBucket {
 	width := r.BucketWidth
-	byStart := make(map[int64]usageBucket, len(r.Series))
-	for _, bucket := range r.Series {
-		byStart[bucket.Start/width*width] = bucket
+	if width <= 0 || span.to <= span.from {
+		return r.Series
 	}
 	start := span.from / width * width
 	if (span.to-start)/width > 1000 {
 		return r.Series
 	}
-	var result []usageBucket
+	byStart := make(map[int64]usageReportBucket, len(r.Series))
+	for _, bucket := range r.Series {
+		byStart[bucket.Start/width*width] = bucket
+	}
+	var result []usageReportBucket
 	for ; start < span.to; start += width {
 		bucket := byStart[start]
 		bucket.Start = max(start, span.from)
@@ -153,6 +169,30 @@ func (r usageReport) fillBuckets(span usageSpan) []usageBucket {
 		result = append(result, bucket)
 	}
 	return result
+}
+
+type cacheHitPoint struct {
+	Start int64    `json:"bucket_start_ms"`
+	End   int64    `json:"bucket_end_ms"`
+	Rate  *float64 `json:"cache_hit_rate"`
+}
+
+func (r usageReport) cacheHitSeries(span usageSpan) []cacheHitPoint {
+	if len(r.Series) == 0 {
+		return nil
+	}
+	var hasInput bool
+	buckets := r.fillBuckets(span)
+	points := make([]cacheHitPoint, 0, len(buckets))
+	for _, bucket := range buckets {
+		rate := bucket.cacheHitRate()
+		hasInput = hasInput || rate != nil
+		points = append(points, cacheHitPoint{Start: bucket.Start, End: bucket.End, Rate: rate})
+	}
+	if !hasInput {
+		return nil
+	}
+	return points
 }
 
 type accessKey struct {
@@ -180,22 +220,24 @@ func (r usageReport) includeHistoricalKeys(keys []accessKey) []accessKey {
 type accessKeyRow struct {
 	accessKey
 	*rankingTotals
-	CacheHitRate      *float64 `json:"cache_hit_rate,omitempty"`
-	CostPerMillion    *float64 `json:"cost_per_million_tokens_usd,omitempty"`
-	CostPerThousand   *float64 `json:"cost_per_thousand_requests_usd,omitempty"`
-	TokensPerRequest  *float64 `json:"tokens_per_request,omitempty"`
-	PricingIncomplete bool     `json:"pricing_incomplete,omitempty"`
-	Error             string   `json:"error,omitempty"`
+	CacheHitRate      *float64        `json:"cache_hit_rate,omitempty"`
+	CacheHitSeries    []cacheHitPoint `json:"cache_hit_series,omitempty"`
+	CostPerMillion    *float64        `json:"cost_per_million_tokens_usd,omitempty"`
+	CostPerThousand   *float64        `json:"cost_per_thousand_requests_usd,omitempty"`
+	TokensPerRequest  *float64        `json:"tokens_per_request,omitempty"`
+	PricingIncomplete bool            `json:"pricing_incomplete,omitempty"`
+	Error             string          `json:"error,omitempty"`
 	costNano          int64
 }
 
 type accessKeyData struct {
 	From  int64          `json:"from_ms"`
+	To    int64          `json:"to_ms"`
 	Items []accessKeyRow `json:"items"`
 }
 
 func (u upstream) accessKeyUsage(ctx context.Context, span usageSpan, keys []accessKey) section[accessKeyData] {
-	data := accessKeyData{From: span.from, Items: make([]accessKeyRow, 0, len(keys))}
+	data := accessKeyData{From: span.from, To: span.to, Items: make([]accessKeyRow, 0, len(keys))}
 	for _, key := range keys {
 		if key.ID > 0 {
 			data.Items = append(data.Items, accessKeyRow{accessKey: key})
@@ -211,6 +253,7 @@ func (u upstream) accessKeyUsage(ctx context.Context, span usageSpan, keys []acc
 				return
 			}
 			row.setMetrics(report.Summary)
+			row.CacheHitSeries = report.cacheHitSeries(span)
 		})
 	}
 	group.Wait()
@@ -235,7 +278,7 @@ func (u upstream) accessKeyUsage(ctx context.Context, span usageSpan, keys []acc
 func (r *accessKeyRow) setMetrics(summary usageSummary) {
 	r.rankingTotals = &summary.rankingTotals
 	r.PricingIncomplete = summary.incomplete()
-	r.CacheHitRate = divided(float64(summary.CacheRead), summary.promptTokens())
+	r.CacheHitRate = summary.cacheHitRate()
 	r.TokensPerRequest = divided(float64(summary.Tokens), summary.Requests)
 	if cost, err := strconv.ParseInt(summary.Cost, 10, 64); err == nil && cost >= 0 {
 		r.costNano = cost

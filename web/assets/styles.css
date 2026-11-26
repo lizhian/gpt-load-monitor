@@ -69,6 +69,22 @@
   --chart-series-total-hover: oklch(84% 0.12 245);
   --chart-series-failure: oklch(70% 0.17 25);
   --chart-highlight-band: oklch(26% 0.012 250);
+  --chart-crosshair: oklch(52% 0.015 250);
+  --chart-point-ring: var(--color-paper-3);
+
+  /* AccessKey cache-hit series palette (12 stable hues on dark graphite) */
+  --ak-series-0: oklch(76% 0.14 240);
+  --ak-series-1: oklch(76% 0.13 185);
+  --ak-series-2: oklch(82% 0.15 80);
+  --ak-series-3: oklch(72% 0.16 28);
+  --ak-series-4: oklch(75% 0.15 300);
+  --ak-series-5: oklch(77% 0.15 145);
+  --ak-series-6: oklch(74% 0.16 350);
+  --ak-series-7: oklch(80% 0.12 210);
+  --ak-series-8: oklch(82% 0.15 115);
+  --ak-series-9: oklch(73% 0.14 268);
+  --ak-series-10: oklch(77% 0.15 55);
+  --ak-series-11: oklch(76% 0.14 325);
 }
 
 *,
@@ -987,6 +1003,162 @@ input {
   color: var(--color-accent);
 }
 
+/* AccessKey Cache-Hit Trend Legend & Inspection */
+.ak-chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-xs);
+  max-width: 100%;
+}
+
+.ak-legend-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  min-block-size: 28px;
+  min-inline-size: 28px;
+  max-width: 100%;
+  padding: var(--space-2xs) var(--space-sm);
+  border: var(--rule-hair) solid var(--color-rule-2);
+  border-radius: var(--radius-chip);
+  background-color: var(--color-paper-3);
+  color: var(--color-ink);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  line-height: 1.2;
+  cursor: pointer;
+  transition: background-color var(--dur-short) var(--ease-out),
+    border-color var(--dur-short) var(--ease-out),
+    color var(--dur-short) var(--ease-out),
+    opacity var(--dur-short) var(--ease-out);
+}
+
+.ak-legend-btn:hover {
+  background-color: var(--color-paper-2);
+  border-color: var(--color-ink-2);
+}
+
+.ak-legend-btn[aria-pressed="false"] {
+  background-color: transparent;
+  border-style: dashed;
+  border-color: var(--color-rule);
+  color: var(--color-muted);
+}
+
+.ak-legend-btn[aria-pressed="false"]:hover {
+  border-color: var(--color-rule-2);
+  color: var(--color-ink-2);
+}
+
+.ak-legend-swatch {
+  flex: 0 0 auto;
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background-color: var(--series-color, var(--color-cool));
+  border: 2px solid var(--series-color, var(--color-cool));
+}
+
+.ak-legend-btn[aria-pressed="false"] .ak-legend-swatch {
+  background-color: transparent;
+  opacity: 0.65;
+}
+
+.ak-legend-name {
+  min-width: 0;
+  max-width: 24ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ak-legend-btn[aria-pressed="false"] .ak-legend-name {
+  text-decoration: line-through;
+}
+
+.ak-legend-tag {
+  flex: 0 0 auto;
+  font-size: 0.6875rem;
+  color: var(--color-muted);
+}
+
+.ak-series-color--0 { --series-color: var(--ak-series-0); }
+.ak-series-color--1 { --series-color: var(--ak-series-1); }
+.ak-series-color--2 { --series-color: var(--ak-series-2); }
+.ak-series-color--3 { --series-color: var(--ak-series-3); }
+.ak-series-color--4 { --series-color: var(--ak-series-4); }
+.ak-series-color--5 { --series-color: var(--ak-series-5); }
+.ak-series-color--6 { --series-color: var(--ak-series-6); }
+.ak-series-color--7 { --series-color: var(--ak-series-7); }
+.ak-series-color--8 { --series-color: var(--ak-series-8); }
+.ak-series-color--9 { --series-color: var(--ak-series-9); }
+.ak-series-color--10 { --series-color: var(--ak-series-10); }
+.ak-series-color--11 { --series-color: var(--ak-series-11); }
+
+.ak-chart-inspect {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2xs) var(--space-sm);
+  min-height: 2.125rem;
+}
+
+.ak-inspect-time {
+  color: var(--color-ink);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.ak-inspect-list {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2xs) var(--space-sm);
+  min-width: 0;
+}
+
+.ak-inspect-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.ak-inspect-item .ak-legend-swatch {
+  width: 8px;
+  height: 8px;
+}
+
+.ak-inspect-name {
+  font-family: var(--font-body);
+  color: var(--color-ink-2);
+  max-width: 18ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ak-inspect-val {
+  color: var(--color-ink);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.ak-inspect-val--empty {
+  color: var(--color-muted);
+  font-weight: 400;
+}
+
+@media (pointer: coarse) {
+  .ak-legend-btn {
+    min-block-size: 44px;
+    min-inline-size: 44px;
+  }
+}
+
 /* ==========================================================================
    Usage Rankings Tabs
    ========================================================================== */
@@ -1389,6 +1561,14 @@ input {
   .cell-entity,
   .data-table--access-keys .cell-entity {
     max-width: 168px;
+  }
+
+  .ak-legend-name {
+    max-width: 16ch;
+  }
+
+  .ak-inspect-name {
+    max-width: 14ch;
   }
 }
 

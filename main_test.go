@@ -151,9 +151,19 @@ func TestDashboardQuotaAndAccessKeyWindow(t *testing.T) {
 				data = `{"summary":{"estimated_cost_nano_usd":"0"}}`
 				switch q.Get("access_key_id") {
 				case "2":
-					data = `{"summary":{"request_count":4,"total_tokens":2000,"uncached_input_tokens":50,"cache_read_tokens":60,"cache_write_5m_tokens":5,"cache_write_1h_tokens":3,"cache_write_unknown_tokens":2,"estimated_cost_nano_usd":"2400000000","unpriced_request_count":1}}`
+					data = fmt.Sprintf(`{
+						"bucket_width_ms":3600000,
+						"summary":{"request_count":4,"total_tokens":2000,"uncached_input_tokens":50,"cache_read_tokens":60,
+							"cache_write_5m_tokens":5,"cache_write_1h_tokens":3,"cache_write_unknown_tokens":2,
+							"estimated_cost_nano_usd":"2400000000","unpriced_request_count":1},
+						"series":[
+							{"bucket_start_ms":%d,"uncached_input_tokens":25,"cache_read_tokens":60,
+								"cache_write_5m_tokens":5,"cache_write_1h_tokens":3,"cache_write_unknown_tokens":2},
+							{"bucket_start_ms":%d,"uncached_input_tokens":25}
+						]
+					}`, yesterday.UnixMilli(), yesterday.Add(2*time.Hour).UnixMilli())
 				case "4":
-					data = `{"summary":{"request_count":1,"estimated_cost_nano_usd":"1000000000"}}`
+					data = fmt.Sprintf(`{"bucket_width_ms":3600000,"summary":{"request_count":1,"cache_read_tokens":100,"estimated_cost_nano_usd":"1000000000"},"series":[{"bucket_start_ms":%d,"cache_read_tokens":100}]}`, yesterday.Add(time.Hour).UnixMilli())
 				case "":
 					data = `{"summary":{"estimated_cost_nano_usd":"0"},"distributions":{"access_key":{"requests":{"items":[{"access_key_id":4}]}}}}`
 				}
@@ -226,5 +236,30 @@ func TestDashboardQuotaAndAccessKeyWindow(t *testing.T) {
 				t.Errorf("idle AccessKey %s should be unavailable", field)
 			}
 		}
+	}
+
+	for _, tc := range []struct {
+		index int
+		rates []any
+	}{
+		{0, []any{60.0 / 95.0, nil, float64(0)}},
+		{1, []any{nil, float64(1), nil}},
+	} {
+		points, ok := items[tc.index]["cache_hit_series"].([]any)
+		if !ok || len(points) != 24 {
+			t.Fatalf("AccessKey %v has no aligned cache hit series", items[tc.index]["id"])
+		}
+		for hour, want := range tc.rates {
+			point := points[hour].(map[string]any)
+			start := yesterday.Add(time.Duration(hour) * time.Hour)
+			rate, exists := point["cache_hit_rate"]
+			if !exists || rate != want || point["bucket_start_ms"] != float64(start.UnixMilli()) ||
+				point["bucket_end_ms"] != float64(start.Add(time.Hour).UnixMilli()) {
+				t.Errorf("AccessKey %v hour %d: got %v, want rate %v", items[tc.index]["id"], hour, point, want)
+			}
+		}
+	}
+	if _, exists := items[2]["cache_hit_series"]; exists {
+		t.Error("idle AccessKey should have no cache series")
 	}
 }

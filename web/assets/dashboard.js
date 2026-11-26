@@ -14,6 +14,7 @@
   const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000;
   const REFRESH_INTERVAL_MS = 60000;
   const RANKING_DEFAULT_LIMIT = 10;
+  const ACCESS_KEY_PALETTE_SIZE = 12;
 
   function createRangeCache() {
     const cache = {};
@@ -52,6 +53,24 @@
       hoveredIndex: -1,
       focusedIndex: -1,
       bars: [],
+    },
+    accessKeyCacheChart: {
+      range: "24h",
+      fromMs: null,
+      toMs: null,
+      buckets: [],
+      series: [],
+      bucketWidthMs: null,
+      isDay: false,
+      hiddenKeyIds: new Set(),
+      colorByKeyId: new Map(),
+      hoveredIndex: -1,
+      focusedIndex: -1,
+      interactionSource: null,
+      pointsX: [],
+      plotLeft: 0,
+      plotRight: 0,
+      legendSignature: "",
     },
   };
 
@@ -627,6 +646,7 @@
         emptyEl.hidden = false;
       }
       if (scrollEl) scrollEl.hidden = true;
+      renderAccessKeyCacheSection(activeRange, akState);
       return;
     }
 
@@ -637,6 +657,7 @@
         emptyEl.hidden = false;
       }
       if (scrollEl) scrollEl.hidden = true;
+      renderAccessKeyCacheSection(activeRange, akState);
       return;
     }
 
@@ -649,9 +670,7 @@
     for (const item of items) {
       if (!item || typeof item !== "object") continue;
 
-      const nameText = item.name
-        ? String(item.name)
-        : (item.id != null && item.id !== "" ? `AccessKey #${item.id}` : "未命名 AccessKey");
+      const nameText = getAccessKeyDisplayName(item);
       const pricingIncomplete = Boolean(item.pricing_incomplete);
       const rowError = item.error ? String(item.error).trim() : "";
 
@@ -744,6 +763,8 @@
         caveatsEl.hidden = true;
       }
     }
+
+    renderAccessKeyCacheSection(activeRange, akState);
   }
 
   function sortAccessKeyRows() {
@@ -1813,6 +1834,694 @@
   }
 
   /* ------------------------------------------------------------------------
+     AccessKey Cache-Hit Trend Chart (Multi-Series Line, 0-100%, Gaps, Toggle)
+     ------------------------------------------------------------------------ */
+
+  const ACCESS_KEY_FALLBACK_COLORS = [
+    "#7ab3f0",
+    "#5ec2ba",
+    "#e5b95c",
+    "#e47c67",
+    "#b78ef0",
+    "#6cc98a",
+    "#e67ba8",
+    "#64c9e0",
+    "#b9cc5e",
+    "#8e9df0",
+    "#e89e64",
+    "#d68de0",
+  ];
+
+  function getAccessKeyDisplayName(item) {
+    const rawName = item && item.name != null ? String(item.name).trim() : "";
+    if (rawName) return rawName;
+    if (item && item.id != null && item.id !== "") return `AccessKey #${item.id}`;
+    return "未命名 AccessKey";
+  }
+
+  function getAccessKeyColorIndex(id) {
+    const num = toFiniteNum(id);
+    if (num !== null) {
+      return Math.abs(Math.trunc(num)) % ACCESS_KEY_PALETTE_SIZE;
+    }
+    const str = String(id == null ? "" : id);
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      hash = ((hash * 31) + str.charCodeAt(i)) >>> 0;
+    }
+    return hash % ACCESS_KEY_PALETTE_SIZE;
+  }
+
+  function assignAccessKeyColors(rows) {
+    const assigned = new Set();
+    const previous = state.accessKeyCacheChart.colorByKeyId;
+    const pending = [];
+    for (const row of rows) {
+      const color = previous.get(row.keyId);
+      if (color === undefined || assigned.has(color)) {
+        pending.push(row);
+      } else {
+        row.colorIndex = color;
+        assigned.add(color);
+      }
+    }
+    for (const row of pending) {
+      const preferred = getAccessKeyColorIndex(row.keyId);
+      let color = preferred;
+      while (assigned.size < ACCESS_KEY_PALETTE_SIZE && assigned.has(color)) {
+        color = (color + 1) % ACCESS_KEY_PALETTE_SIZE;
+      }
+      row.colorIndex = color;
+      previous.set(row.keyId, color);
+      assigned.add(color);
+    }
+  }
+
+  function getAccessKeyChartColors() {
+    const styles = getComputedStyle(document.documentElement);
+    const palette = [];
+    for (let i = 0; i < ACCESS_KEY_PALETTE_SIZE; i++) {
+      palette.push(
+        styles.getPropertyValue(`--ak-series-${i}`).trim() ||
+        ACCESS_KEY_FALLBACK_COLORS[i]
+      );
+    }
+    return {
+      grid: styles.getPropertyValue("--chart-grid").trim() || "#3a3e47",
+      axisText: styles.getPropertyValue("--chart-axis-text").trim() || "#9ea4b0",
+      crosshair: styles.getPropertyValue("--chart-crosshair").trim() || "#6f7785",
+      pointRing: styles.getPropertyValue("--chart-point-ring").trim() || "#1b1d22",
+      monoFont: styles.getPropertyValue("--font-outlier").trim() || "monospace",
+      palette,
+    };
+  }
+
+  function formatBucketWidthLabel(widthMs) {
+    const w = toFiniteNum(widthMs);
+    if (w === null || w <= 0) return "";
+    const rounded = Math.round(w);
+    const dayMs = 86400000;
+    const hourMs = 3600000;
+    const minMs = 60000;
+    if (rounded >= dayMs && rounded % dayMs === 0) {
+      const days = rounded / dayMs;
+      return days === 1 ? "按天" : `每 ${days} 天`;
+    }
+    if (rounded >= hourMs && rounded % hourMs === 0) {
+      const hours = rounded / hourMs;
+      return hours === 1 ? "按小时" : `每 ${hours} 小时`;
+    }
+    if (rounded >= minMs && rounded % minMs === 0) {
+      const mins = rounded / minMs;
+      return mins === 1 ? "按分钟" : `每 ${mins} 分钟`;
+    }
+    return "";
+  }
+
+  function buildAccessKeyCacheChartModel(data, range) {
+    const items = data && Array.isArray(data.items) ? data.items : [];
+    const eligibleRows = [];
+    const bucketMap = new Map();
+
+    for (const item of items) {
+      if (!item || typeof item !== "object" || item.stale) continue;
+      if (!Array.isArray(item.cache_hit_series) || item.cache_hit_series.length === 0) continue;
+
+      const pointsByStart = new Map();
+      const rowBuckets = [];
+      let hasValidPoint = false;
+
+      for (const pt of item.cache_hit_series) {
+        if (!pt || typeof pt !== "object") continue;
+        const startMs = toFiniteNum(pt.bucket_start_ms);
+        if (startMs === null) continue;
+        const endMs = toFiniteNum(pt.bucket_end_ms);
+        const rate = toFiniteNum(pt.cache_hit_rate);
+        if (rate !== null) hasValidPoint = true;
+        pointsByStart.set(startMs, rate);
+        rowBuckets.push({ startMs, endMs });
+      }
+
+      if (!hasValidPoint) continue;
+
+      for (const b of rowBuckets) {
+        const existing = bucketMap.get(b.startMs);
+        if (!existing || (existing.endMs === null && b.endMs !== null)) {
+          bucketMap.set(b.startMs, b);
+        }
+      }
+
+      const name = getAccessKeyDisplayName(item);
+      const hasId = item.id != null && item.id !== "";
+      const keyId = hasId ? String(item.id) : name;
+      eligibleRows.push({
+        keyId,
+        id: item.id,
+        name,
+        deleted: Boolean(item.deleted),
+        pointsByStart,
+      });
+    }
+
+    const buckets = Array.from(bucketMap.values()).sort((a, b) => a.startMs - b.startMs);
+    assignAccessKeyColors(eligibleRows);
+    const series = eligibleRows.map((row) => ({
+      keyId: row.keyId,
+      id: row.id,
+      name: row.name,
+      deleted: row.deleted,
+      colorIndex: row.colorIndex,
+      values: buckets.map((b) => (row.pointsByStart.has(b.startMs) ? row.pointsByStart.get(b.startMs) : null)),
+    }));
+
+    let bucketWidthMs = null;
+    for (const b of buckets) {
+      if (b.endMs !== null && b.endMs > b.startMs) {
+        const span = b.endMs - b.startMs;
+        if (bucketWidthMs === null || span > bucketWidthMs) {
+          bucketWidthMs = span;
+        }
+      }
+    }
+    if (bucketWidthMs === null && buckets.length > 1) {
+      const diffs = [];
+      for (let i = 1; i < buckets.length; i++) {
+        const d = buckets[i].startMs - buckets[i - 1].startMs;
+        if (d > 0) diffs.push(d);
+      }
+      if (diffs.length > 0) {
+        diffs.sort((a, b) => a - b);
+        bucketWidthMs = diffs[Math.floor(diffs.length / 2)];
+      }
+    }
+
+    const isDay = bucketWidthMs !== null
+      ? bucketWidthMs >= 20 * 3600 * 1000
+      : range === "30d";
+
+    return { buckets, series, bucketWidthMs, isDay };
+  }
+
+  function getVisibleAccessKeyCacheSeries() {
+    const chart = state.accessKeyCacheChart;
+    return chart.series.filter((s) => !chart.hiddenKeyIds.has(s.keyId));
+  }
+
+  function formatAccessKeyBucketSpan(bucket, range) {
+    if (!bucket) return "—";
+    return formatBucketSpan(bucket.startMs, bucket.endMs, range, "hour");
+  }
+
+  function formatAccessKeyAxisLabel(startMs, range, isDay, spanMs) {
+    const p = getBeijingParts(startMs);
+    if (!p) return "";
+    if (isDay) return `${p.month}-${p.day}`;
+    if (range === "7d" || range === "30d" || spanMs > 36 * 3600 * 1000) {
+      return `${p.month}-${p.day} ${p.hour}:${p.minute}`;
+    }
+    return `${p.hour}:${p.minute}`;
+  }
+
+  function setAccessKeyCacheLiveText(text) {
+    const liveEl = byId("access-keys-cache-live");
+    if (!liveEl) return;
+    liveEl.textContent = text || "";
+  }
+
+  function renderAccessKeyCacheSection(activeRange, akState) {
+    const chart = state.accessKeyCacheChart;
+    const data = akState && akState.data ? akState.data : null;
+    const model = data
+      ? buildAccessKeyCacheChartModel(data, activeRange)
+      : { buckets: [], series: [], bucketWidthMs: null, isDay: activeRange === "30d" };
+
+    const rangeChanged = chart.range !== activeRange;
+    const focusedBucket = rangeChanged ? null : chart.buckets[chart.focusedIndex];
+    const first = model.buckets[0];
+    const last = model.buckets[model.buckets.length - 1];
+    chart.range = activeRange;
+    chart.fromMs = toFiniteNum(data?.from_ms) ?? first?.startMs ?? null;
+    chart.toMs = toFiniteNum(data?.to_ms) ?? last?.endMs ?? last?.startMs ?? null;
+    chart.buckets = model.buckets;
+    chart.series = model.series;
+    chart.bucketWidthMs = model.bucketWidthMs;
+    chart.isDay = model.isDay;
+    chart.hoveredIndex = -1;
+
+    chart.focusedIndex = focusedBucket ? chart.buckets.findIndex((bucket) =>
+      bucket.startMs === focusedBucket.startMs ||
+      (focusedBucket.endMs !== null && bucket.endMs === focusedBucket.endMs)
+    ) : -1;
+    if (chart.focusedIndex < 0) {
+      chart.interactionSource = null;
+      setAccessKeyCacheLiveText("");
+    }
+
+    const winLabelEl = byId("access-keys-cache-window-label");
+    if (winLabelEl) {
+      const { fromMs, toMs } = chart;
+      if (fromMs !== null && toMs !== null && toMs >= fromMs) {
+        const granText = formatBucketWidthLabel(chart.bucketWidthMs);
+        const gran = granText ? `（${granText}）` : "";
+        winLabelEl.textContent = `${formatLocalShortTime(fromMs)} 至 ${formatLocalShortTime(toMs)}${gran}`;
+      } else {
+        winLabelEl.textContent = rangeLabel(activeRange);
+      }
+    }
+
+    renderAccessKeyCacheLegend();
+    renderAccessKeyCacheChart(false);
+    renderAccessKeyCacheTable();
+  }
+
+  function renderAccessKeyCacheLegend() {
+    const legendEl = byId("access-keys-cache-legend");
+    if (!legendEl) return;
+    const chart = state.accessKeyCacheChart;
+
+    if (chart.series.length === 0) {
+      clearChildren(legendEl);
+      legendEl.hidden = true;
+      chart.legendSignature = "";
+      return;
+    }
+
+    legendEl.hidden = false;
+    const nextSignature = chart.series
+      .map((s) => `${s.keyId}|${s.name}|${s.colorIndex}|${s.deleted ? 1 : 0}`)
+      .join("\n");
+
+    if (nextSignature === chart.legendSignature) {
+      const buttons = legendEl.querySelectorAll("button[data-cache-key-id]");
+      for (const btn of buttons) {
+        const isVisible = !chart.hiddenKeyIds.has(btn.dataset.cacheKeyId);
+        btn.setAttribute("aria-pressed", String(isVisible));
+      }
+      return;
+    }
+
+    const activeEl = document.activeElement;
+    const focusedKeyId = activeEl && legendEl.contains(activeEl) && activeEl.dataset
+      ? activeEl.dataset.cacheKeyId
+      : null;
+
+    clearChildren(legendEl);
+    let buttonToRefocus = null;
+
+    for (const s of chart.series) {
+      const isVisible = !chart.hiddenKeyIds.has(s.keyId);
+      const children = [
+        createEl("span", {
+          className: `ak-legend-swatch ak-series-color--${s.colorIndex}`,
+          attrs: { "aria-hidden": "true" },
+        }),
+        createEl("span", {
+          className: "ak-legend-name",
+          text: s.name,
+          attrs: { title: s.name },
+        }),
+      ];
+      if (s.deleted) {
+        children.push(createEl("span", { className: "ak-legend-tag", text: "已删除" }));
+      }
+      const btn = createEl("button", {
+        className: "ak-legend-btn",
+        attrs: {
+          type: "button",
+          "aria-pressed": String(isVisible),
+        },
+        dataset: { cacheKeyId: s.keyId },
+      }, children);
+      legendEl.appendChild(btn);
+      if (focusedKeyId && s.keyId === focusedKeyId) {
+        buttonToRefocus = btn;
+      }
+    }
+
+    chart.legendSignature = nextSignature;
+    if (buttonToRefocus) {
+      buttonToRefocus.focus();
+    }
+  }
+
+  function updateAccessKeyCacheInspect(visibleSeries, announceLive) {
+    const inspectEl = byId("access-keys-cache-inspect");
+    if (!inspectEl) return;
+    const chart = state.accessKeyCacheChart;
+    clearChildren(inspectEl);
+
+    if (chart.series.length === 0 || chart.buckets.length === 0) {
+      const akState = state.accessKeysByRange[state.range];
+      const msg = state.isLoading && !(akState && akState.data)
+        ? `正在加载${rangeLabel(state.range)}缓存命中率分桶数据…`
+        : "该时间范围内暂无缓存命中率分桶数据。";
+      inspectEl.textContent = msg;
+      return;
+    }
+
+    if (visibleSeries.length === 0) {
+      const msg = "已隐藏全部 AccessKey 曲线，点击上方图例可重新显示。";
+      inspectEl.textContent = msg;
+      if (announceLive) setAccessKeyCacheLiveText(msg);
+      return;
+    }
+
+    const activeIdx = chart.hoveredIndex >= 0 ? chart.hoveredIndex : chart.focusedIndex;
+    if (activeIdx >= 0 && activeIdx < chart.buckets.length) {
+      const span = formatAccessKeyBucketSpan(chart.buckets[activeIdx], chart.range);
+      const itemNodes = [];
+      const liveParts = [];
+
+      for (const s of visibleSeries) {
+        const val = s.values[activeIdx];
+        const hasVal = val !== null;
+        const valText = hasVal ? formatPercent(val) : "无数据";
+        liveParts.push(`${s.name} ${valText}`);
+        itemNodes.push(
+          createEl("span", { className: "ak-inspect-item" }, [
+            createEl("span", {
+              className: `ak-legend-swatch ak-series-color--${s.colorIndex}`,
+              attrs: { "aria-hidden": "true" },
+            }),
+            createEl("span", {
+              className: "ak-inspect-name",
+              text: s.name,
+              attrs: { title: s.name },
+            }),
+            createEl("span", {
+              className: hasVal ? "ak-inspect-val measured" : "ak-inspect-val ak-inspect-val--empty",
+              text: valText,
+            }),
+          ])
+        );
+      }
+
+      inspectEl.appendChild(createEl("span", { className: "ak-inspect-time measured", text: span }));
+      inspectEl.appendChild(createEl("span", { className: "ak-inspect-list" }, itemNodes));
+
+      if (announceLive) {
+        setAccessKeyCacheLiveText(`${span}：${liveParts.join("，")}`);
+      }
+      return;
+    }
+
+    inspectEl.textContent =
+      `共 ${chart.buckets.length} 个时间分桶，显示 ${visibleSeries.length}/${chart.series.length} 条曲线（悬停、轻点或聚焦图表按左右方向键查看明细）。`;
+  }
+
+  function renderAccessKeyCacheChart(announceLive) {
+    const canvas = byId("access-keys-cache-canvas");
+    const emptyEl = byId("access-keys-cache-empty");
+    if (!canvas) return;
+
+    const chart = state.accessKeyCacheChart;
+    const visibleSeries = getVisibleAccessKeyCacheSeries();
+    updateAccessKeyCacheInspect(visibleSeries, Boolean(announceLive));
+
+    if (chart.series.length === 0 || chart.buckets.length === 0) {
+      canvas.hidden = true;
+      if (emptyEl) {
+        const akState = state.accessKeysByRange[state.range];
+        const hasErr = Boolean((akState && akState.error) || state.globalError);
+        emptyEl.textContent = state.isLoading && !(akState && akState.data)
+          ? `正在加载${rangeLabel(state.range)}缓存命中率趋势…`
+          : (hasErr && !(akState && akState.data) ? "缓存命中率趋势加载失败" : "该时间范围内暂无缓存命中率趋势数据");
+        emptyEl.hidden = false;
+      }
+      chart.pointsX = [];
+      return;
+    }
+
+    if (visibleSeries.length === 0) {
+      canvas.hidden = true;
+      if (emptyEl) {
+        emptyEl.textContent = "已隐藏全部 AccessKey 曲线，点击上方图例可重新显示";
+        emptyEl.hidden = false;
+      }
+      chart.pointsX = [];
+      return;
+    }
+
+    canvas.hidden = false;
+    if (emptyEl) emptyEl.hidden = true;
+
+    const rect = canvas.getBoundingClientRect();
+    const cssWidth = Math.max(200, Math.floor(rect.width || 600));
+    const cssHeight = Math.max(180, Math.floor(rect.height || 220));
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+    if (canvas.width !== cssWidth * dpr || canvas.height !== cssHeight * dpr) {
+      canvas.width = cssWidth * dpr;
+      canvas.height = cssHeight * dpr;
+    }
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    ctx.save();
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+    const colors = getAccessKeyChartColors();
+    const padLeft = 42;
+    const padRight = 12;
+    const padTop = 12;
+    const padBottom = 28;
+    const plotW = Math.max(10, cssWidth - padLeft - padRight);
+    const plotH = Math.max(10, cssHeight - padTop - padBottom);
+    const baseY = padTop + plotH;
+
+    const count = chart.buckets.length;
+    const spanMs = chart.toMs - chart.fromMs;
+    const pointsX = chart.buckets.map(({ startMs, endMs }) => {
+      const midpoint = (startMs + (endMs ?? startMs)) / 2;
+      const fraction = spanMs > 0 ? (midpoint - chart.fromMs) / spanMs : 0.5;
+      return padLeft + Math.max(0, Math.min(1, fraction)) * plotW;
+    });
+    chart.pointsX = pointsX;
+    chart.plotLeft = padLeft;
+    chart.plotRight = cssWidth - padRight;
+
+    // Fixed 0-100% horizontal dashed gridlines & Y-axis ticks (0/25/50/75/100)
+    ctx.font = `11px ${colors.monoFont}`;
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    ctx.lineWidth = 1;
+    const yTicks = [100, 75, 50, 25, 0];
+
+    for (let i = 0; i < yTicks.length; i++) {
+      const ratio = i / (yTicks.length - 1);
+      const y = Math.round(padTop + plotH * ratio) + 0.5;
+
+      ctx.strokeStyle = colors.grid;
+      ctx.setLineDash([2, 4]);
+      ctx.beginPath();
+      ctx.moveTo(padLeft, y);
+      ctx.lineTo(cssWidth - padRight, y);
+      ctx.stroke();
+
+      ctx.fillStyle = colors.axisText;
+      ctx.fillText(`${yTicks[i]}%`, padLeft - 8, y);
+    }
+    ctx.setLineDash([]);
+
+    // Active bucket vertical guide hairline
+    const activeIdx = chart.hoveredIndex >= 0 ? chart.hoveredIndex : chart.focusedIndex;
+    if (activeIdx >= 0 && activeIdx < count) {
+      const gx = Math.round(pointsX[activeIdx]) + 0.5;
+      ctx.strokeStyle = colors.crosshair;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(gx, padTop);
+      ctx.lineTo(gx, baseY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // Draw straight chronological line segments (break on null/missing, no interpolation)
+    for (const s of visibleSeries) {
+      const strokeColor = colors.palette[s.colorIndex % colors.palette.length];
+      ctx.strokeStyle = strokeColor;
+      ctx.lineWidth = 2;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.beginPath();
+
+      let inSegment = false;
+      for (let i = 0; i < count; i++) {
+        const val = s.values[i];
+        if (val === null) {
+          inSegment = false;
+          continue;
+        }
+        const clamped = Math.max(0, Math.min(1, val));
+        const x = pointsX[i];
+        const y = padTop + plotH * (1 - clamped);
+        if (!inSegment) {
+          ctx.moveTo(x, y);
+          inSegment = true;
+        } else {
+          ctx.lineTo(x, y);
+        }
+      }
+      ctx.stroke();
+    }
+
+    // Draw point markers for all valid buckets (including isolated single buckets and 0%)
+    const baseRadius = count > 36 ? 2.25 : 2.75;
+    for (const s of visibleSeries) {
+      const fillColor = colors.palette[s.colorIndex % colors.palette.length];
+      for (let i = 0; i < count; i++) {
+        const val = s.values[i];
+        if (val === null) continue;
+        const clamped = Math.max(0, Math.min(1, val));
+        const x = pointsX[i];
+        const y = padTop + plotH * (1 - clamped);
+        const isIsolated = (i === 0 || s.values[i - 1] === null) && (i === count - 1 || s.values[i + 1] === null);
+        const isActive = i === activeIdx;
+        const r = isActive ? 4.5 : (isIsolated ? 3.5 : baseRadius);
+
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fillStyle = fillColor;
+        ctx.fill();
+        ctx.lineWidth = isActive ? 1.5 : 1.25;
+        ctx.strokeStyle = colors.pointRing;
+        ctx.stroke();
+      }
+    }
+
+    // Non-overlapping Asia/Shanghai X-axis time labels
+    const firstBucket = chart.buckets[0];
+    ctx.fillStyle = colors.axisText;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+
+    const sampleLabel = formatAccessKeyAxisLabel(firstBucket.startMs, chart.range, chart.isDay, spanMs);
+    const sampleWidth = Math.max(32, ctx.measureText(sampleLabel).width);
+    const minLabelGap = 14;
+    const maxLabels = count === 1
+      ? 1
+      : Math.min(count, Math.max(2, 1 + Math.floor(plotW / (sampleWidth + minLabelGap))));
+
+    const candidateIndices = [];
+    for (let k = 0; k < maxLabels; k++) {
+      const idx = maxLabels === 1 ? 0 : Math.round((k * (count - 1)) / (maxLabels - 1));
+      if (candidateIndices.length === 0 || candidateIndices[candidateIndices.length - 1] !== idx) {
+        candidateIndices.push(idx);
+      }
+    }
+
+    let prevRight = -Infinity;
+    for (const idx of candidateIndices) {
+      const label = formatAccessKeyAxisLabel(chart.buckets[idx].startMs, chart.range, chart.isDay, spanMs);
+      if (!label) continue;
+      const w = ctx.measureText(label).width;
+      const half = w / 2;
+      const minCenter = padLeft + half;
+      const maxCenter = cssWidth - padRight - half;
+      const cx = maxCenter >= minCenter
+        ? Math.max(minCenter, Math.min(maxCenter, pointsX[idx]))
+        : padLeft + plotW / 2;
+      const left = cx - half;
+      const right = cx + half;
+      if (left < prevRight + 10) continue;
+      ctx.fillText(label, cx, baseY + 8);
+      prevRight = right;
+    }
+
+    ctx.restore();
+  }
+
+  function renderAccessKeyCacheTable() {
+    const detailsEl = byId("access-keys-cache-details");
+    const thead = byId("access-keys-cache-table-head");
+    const tbody = byId("access-keys-cache-table-body");
+    if (!detailsEl || !thead || !tbody) return;
+
+    const chart = state.accessKeyCacheChart;
+    if (chart.series.length === 0 || chart.buckets.length === 0) {
+      detailsEl.hidden = true;
+      return;
+    }
+
+    detailsEl.hidden = false;
+    if (!detailsEl.open) return;
+    clearChildren(thead);
+    clearChildren(tbody);
+    const visibleSeries = getVisibleAccessKeyCacheSeries();
+
+    if (visibleSeries.length === 0) {
+      thead.appendChild(
+        createEl("tr", null, [
+          createEl("th", { attrs: { scope: "col" }, text: "状态" }),
+        ])
+      );
+      tbody.appendChild(
+        createEl("tr", null, [
+          createEl("td", { className: "text-muted", text: "已隐藏全部 AccessKey 曲线，点击上方图例可重新显示。" }),
+        ])
+      );
+      return;
+    }
+
+    const headerCells = [
+      createEl("th", { attrs: { scope: "col" }, className: "col-sticky", text: "时间段" }),
+    ];
+    for (const s of visibleSeries) {
+      headerCells.push(
+        createEl("th", {
+          attrs: { scope: "col", title: s.name },
+          className: "num",
+          text: s.name,
+        })
+      );
+    }
+    thead.appendChild(createEl("tr", null, headerCells));
+
+    for (let i = 0; i < chart.buckets.length; i++) {
+      const rowCells = [
+        createEl("th", {
+          attrs: { scope: "row" },
+          className: "col-sticky measured",
+          text: formatAccessKeyBucketSpan(chart.buckets[i], chart.range),
+        }),
+      ];
+      for (const s of visibleSeries) {
+        const val = s.values[i];
+        const hasVal = val !== null;
+        rowCells.push(
+          createEl("td", {
+            className: hasVal ? "num" : "num text-muted",
+            text: hasVal ? formatPercent(val) : "无数据",
+          })
+        );
+      }
+      tbody.appendChild(createEl("tr", null, rowCells));
+    }
+  }
+
+  function findAccessKeyChartIndexAtClientX(canvas, clientX) {
+    const chart = state.accessKeyCacheChart;
+    const pointsX = chart.pointsX;
+    if (!pointsX || pointsX.length === 0) return -1;
+    const rect = canvas.getBoundingClientRect();
+    const x = clientX - rect.left;
+    if (x < chart.plotLeft - 12 || x > chart.plotRight + 12) return -1;
+    let bestIdx = 0;
+    let bestDist = Math.abs(x - pointsX[0]);
+    for (let i = 1; i < pointsX.length; i++) {
+      const dist = Math.abs(x - pointsX[i]);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  }
+
+  /* ------------------------------------------------------------------------
      API Fetching & State Application (Stale-Proof + Independent Resilience)
      ------------------------------------------------------------------------ */
 
@@ -2103,6 +2812,130 @@
         ro.observe(canvas);
       } else {
         window.addEventListener("resize", renderTrendChart);
+      }
+    }
+
+    // AccessKey cache-hit chart legend toggles, pointer/tap & keyboard inspection
+    const akLegend = byId("access-keys-cache-legend");
+    if (akLegend) {
+      akLegend.addEventListener("click", function (ev) {
+        const btn = ev.target && typeof ev.target.closest === "function"
+          ? ev.target.closest("button[data-cache-key-id]")
+          : null;
+        if (!btn) return;
+        const keyId = btn.dataset.cacheKeyId;
+        if (!keyId) return;
+        const chart = state.accessKeyCacheChart;
+        if (chart.hiddenKeyIds.has(keyId)) {
+          chart.hiddenKeyIds.delete(keyId);
+          btn.setAttribute("aria-pressed", "true");
+        } else {
+          chart.hiddenKeyIds.add(keyId);
+          btn.setAttribute("aria-pressed", "false");
+        }
+        const visibleAfter = getVisibleAccessKeyCacheSeries();
+        if (visibleAfter.length === 0) {
+          chart.hoveredIndex = -1;
+          chart.focusedIndex = -1;
+          chart.interactionSource = null;
+          renderAccessKeyCacheChart(true);
+        } else {
+          renderAccessKeyCacheChart(false);
+        }
+        renderAccessKeyCacheTable();
+      });
+    }
+
+    const akDetails = byId("access-keys-cache-details");
+    if (akDetails) akDetails.addEventListener("toggle", renderAccessKeyCacheTable);
+
+    const akCanvas = byId("access-keys-cache-canvas");
+    if (akCanvas) {
+      akCanvas.addEventListener("pointermove", function (ev) {
+        if (ev.pointerType === "touch") return;
+        const idx = findAccessKeyChartIndexAtClientX(akCanvas, ev.clientX);
+        if (idx !== state.accessKeyCacheChart.hoveredIndex) {
+          state.accessKeyCacheChart.hoveredIndex = idx;
+          renderAccessKeyCacheChart(false);
+        }
+      });
+
+      akCanvas.addEventListener("pointerleave", function (ev) {
+        if (ev.pointerType === "touch") return;
+        if (state.accessKeyCacheChart.hoveredIndex !== -1) {
+          state.accessKeyCacheChart.hoveredIndex = -1;
+          renderAccessKeyCacheChart(false);
+        }
+      });
+
+      akCanvas.addEventListener("pointerdown", function (ev) {
+        if (ev.pointerType === "mouse" && ev.button !== 0) return;
+        const idx = findAccessKeyChartIndexAtClientX(akCanvas, ev.clientX);
+        if (idx < 0) return;
+        const chart = state.accessKeyCacheChart;
+        chart.focusedIndex = idx;
+        chart.interactionSource = "tap";
+        if (ev.pointerType !== "mouse") {
+          chart.hoveredIndex = -1;
+        }
+        renderAccessKeyCacheChart(true);
+      });
+
+      akCanvas.addEventListener("keydown", function (ev) {
+        const chart = state.accessKeyCacheChart;
+        const len = chart.buckets.length;
+        if (len === 0 || getVisibleAccessKeyCacheSeries().length === 0) return;
+        if (ev.key === "ArrowRight") {
+          ev.preventDefault();
+          chart.hoveredIndex = -1;
+          chart.focusedIndex = chart.focusedIndex < 0 ? 0 : Math.min(len - 1, chart.focusedIndex + 1);
+          chart.interactionSource = "keyboard";
+          renderAccessKeyCacheChart(true);
+        } else if (ev.key === "ArrowLeft") {
+          ev.preventDefault();
+          chart.hoveredIndex = -1;
+          chart.focusedIndex = chart.focusedIndex < 0 ? len - 1 : Math.max(0, chart.focusedIndex - 1);
+          chart.interactionSource = "keyboard";
+          renderAccessKeyCacheChart(true);
+        } else if (ev.key === "Home") {
+          ev.preventDefault();
+          chart.hoveredIndex = -1;
+          chart.focusedIndex = 0;
+          chart.interactionSource = "keyboard";
+          renderAccessKeyCacheChart(true);
+        } else if (ev.key === "End") {
+          ev.preventDefault();
+          chart.hoveredIndex = -1;
+          chart.focusedIndex = len - 1;
+          chart.interactionSource = "keyboard";
+          renderAccessKeyCacheChart(true);
+        } else if (ev.key === "Escape") {
+          if (chart.focusedIndex !== -1) {
+            chart.focusedIndex = -1;
+            chart.interactionSource = null;
+            renderAccessKeyCacheChart(false);
+          }
+        }
+      });
+
+      akCanvas.addEventListener("blur", function () {
+        const chart = state.accessKeyCacheChart;
+        if (chart.interactionSource === "keyboard" && chart.focusedIndex !== -1) {
+          chart.focusedIndex = -1;
+          chart.interactionSource = null;
+          renderAccessKeyCacheChart(false);
+        }
+      });
+
+      if (typeof ResizeObserver === "function") {
+        const akRo = new ResizeObserver(function () {
+          renderAccessKeyCacheChart(false);
+        });
+        akRo.observe(akCanvas);
+      } else {
+        window.addEventListener("resize", function () {
+          renderAccessKeyCacheChart(false);
+        });
       }
     }
 
