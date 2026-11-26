@@ -316,6 +316,13 @@ input {
   color: var(--color-accent-hover);
 }
 
+@media (pointer: coarse) {
+  .range-group .btn--segment {
+    min-block-size: 44px;
+    min-inline-size: 44px;
+  }
+}
+
 .logout-form {
   margin: 0;
   display: inline-flex;

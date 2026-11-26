@@ -22,6 +22,10 @@ func localMidnight(t time.Time) time.Time {
 func selectedUsageSpan(period string, now time.Time) usageSpan {
 	to, from := now, now.Add(-24*time.Hour)
 	switch period {
+	case "6h":
+		from = now.Add(-6 * time.Hour)
+	case "12h":
+		from = now.Add(-12 * time.Hour)
 	case "today":
 		from = localMidnight(now)
 	case "yesterday":
@@ -68,6 +72,12 @@ func (s usageSummary) incomplete() bool {
 type usageReportBucket struct {
 	usageBucket
 	cacheTokens
+	Tokens         *int64 `json:"total_tokens"`
+	Cost           string `json:"estimated_cost_nano_usd"`
+	Unpriced       int64  `json:"unpriced_request_count"`
+	PartialPricing int64  `json:"pricing_partial_count"`
+	MissingUsage   int64  `json:"usage_missing_count"`
+	PartialUsage   int64  `json:"partial_count"`
 }
 
 type usageReport struct {
@@ -171,26 +181,40 @@ func (r usageReport) fillBuckets(span usageSpan) []usageReportBucket {
 	return result
 }
 
-type cacheHitPoint struct {
-	Start int64    `json:"bucket_start_ms"`
-	End   int64    `json:"bucket_end_ms"`
-	Rate  *float64 `json:"cache_hit_rate"`
+type accessKeyUsagePoint struct {
+	Start             int64    `json:"bucket_start_ms"`
+	End               int64    `json:"bucket_end_ms"`
+	Requests          int64    `json:"request_count"`
+	Tokens            *int64   `json:"total_tokens"`
+	CacheHitRate      *float64 `json:"cache_hit_rate"`
+	Cost              string   `json:"estimated_cost_nano_usd,omitempty"`
+	PricingIncomplete bool     `json:"pricing_incomplete,omitempty"`
 }
 
-func (r usageReport) cacheHitSeries(span usageSpan) []cacheHitPoint {
+func (r usageReport) accessKeySeries(span usageSpan) []accessKeyUsagePoint {
 	if len(r.Series) == 0 {
 		return nil
 	}
-	var hasInput bool
 	buckets := r.fillBuckets(span)
-	points := make([]cacheHitPoint, 0, len(buckets))
+	points := make([]accessKeyUsagePoint, 0, len(buckets))
 	for _, bucket := range buckets {
-		rate := bucket.cacheHitRate()
-		hasInput = hasInput || rate != nil
-		points = append(points, cacheHitPoint{Start: bucket.Start, End: bucket.End, Rate: rate})
-	}
-	if !hasInput {
-		return nil
+		point := accessKeyUsagePoint{
+			Start: bucket.Start, End: bucket.End, Requests: bucket.Requests,
+			Tokens: bucket.Tokens, CacheHitRate: bucket.cacheHitRate(), Cost: bucket.Cost,
+			PricingIncomplete: bucket.Unpriced > 0 || bucket.PartialPricing > 0,
+		}
+		tokenIncomplete := bucket.MissingUsage > 0 || bucket.PartialUsage > 0
+		if tokenIncomplete && point.Tokens != nil && *point.Tokens == 0 {
+			point.Tokens = nil
+		} else if !tokenIncomplete && point.Tokens == nil && point.Requests == 0 {
+			point.Tokens = new(int64)
+		}
+		if point.PricingIncomplete && point.Cost == "0" {
+			point.Cost = ""
+		} else if !point.PricingIncomplete && point.Cost == "" && point.Requests == 0 {
+			point.Cost = "0"
+		}
+		points = append(points, point)
 	}
 	return points
 }
@@ -220,13 +244,13 @@ func (r usageReport) includeHistoricalKeys(keys []accessKey) []accessKey {
 type accessKeyRow struct {
 	accessKey
 	*rankingTotals
-	CacheHitRate      *float64        `json:"cache_hit_rate,omitempty"`
-	CacheHitSeries    []cacheHitPoint `json:"cache_hit_series,omitempty"`
-	CostPerMillion    *float64        `json:"cost_per_million_tokens_usd,omitempty"`
-	CostPerThousand   *float64        `json:"cost_per_thousand_requests_usd,omitempty"`
-	TokensPerRequest  *float64        `json:"tokens_per_request,omitempty"`
-	PricingIncomplete bool            `json:"pricing_incomplete,omitempty"`
-	Error             string          `json:"error,omitempty"`
+	CacheHitRate      *float64              `json:"cache_hit_rate,omitempty"`
+	Series            []accessKeyUsagePoint `json:"series,omitempty"`
+	CostPerMillion    *float64              `json:"cost_per_million_tokens_usd,omitempty"`
+	CostPerThousand   *float64              `json:"cost_per_thousand_requests_usd,omitempty"`
+	TokensPerRequest  *float64              `json:"tokens_per_request,omitempty"`
+	PricingIncomplete bool                  `json:"pricing_incomplete,omitempty"`
+	Error             string                `json:"error,omitempty"`
 	costNano          int64
 }
 
@@ -253,7 +277,7 @@ func (u upstream) accessKeyUsage(ctx context.Context, span usageSpan, keys []acc
 				return
 			}
 			row.setMetrics(report.Summary)
-			row.CacheHitSeries = report.cacheHitSeries(span)
+			row.Series = report.accessKeySeries(span)
 		})
 	}
 	group.Wait()

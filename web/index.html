@@ -23,6 +23,20 @@
           <button
             type="button"
             class="btn btn--segment"
+            id="range-6h"
+            data-range="6h"
+            aria-pressed="false"
+          >近 6 小时</button>
+          <button
+            type="button"
+            class="btn btn--segment"
+            id="range-12h"
+            data-range="12h"
+            aria-pressed="false"
+          >近 12 小时</button>
+          <button
+            type="button"
+            class="btn btn--segment"
             id="range-24h"
             data-range="24h"
             aria-pressed="true"
@@ -150,53 +164,57 @@
       </div>
       <p class="visually-hidden" role="status" id="access-key-sort-status"></p>
 
-      <!-- AccessKey 缓存命中率趋势图 -->
-      <div class="chart-panel" id="access-keys-cache-chart-panel">
+      <div class="chart-panel" id="access-keys-trend-chart-panel">
         <div class="chart-header">
-          <div class="chart-title-block">
-            <h3 class="subpanel-title" id="heading-access-keys-cache-chart">缓存命中率趋势</h3>
-            <span class="chart-window measured" id="access-keys-cache-window-label">--</span>
+          <h3 class="subpanel-title" id="heading-access-keys-trend-chart">用量趋势</h3>
+          <div id="access-keys-trend-metrics" class="range-group" role="group" aria-label="用量趋势指标">
+            <button class="btn btn--segment btn--sm" type="button" data-metric="requests" aria-pressed="false">请求数</button>
+            <button class="btn btn--segment btn--sm" type="button" data-metric="tokens" aria-pressed="false">Token 用量</button>
+            <button class="btn btn--segment btn--sm" type="button" data-metric="cache" aria-pressed="false">缓存率</button>
+            <button class="btn btn--segment btn--sm" type="button" data-metric="cost" aria-pressed="true">估算费用</button>
           </div>
         </div>
+        <span class="chart-window measured" id="access-keys-trend-window-label">--</span>
+        <span class="visually-hidden" id="access-keys-trend-selected-metric">估算费用</span>
 
         <div
           class="ak-chart-legend"
-          id="access-keys-cache-legend"
+          id="access-keys-trend-legend"
           role="group"
           aria-label="切换显示的 AccessKey 曲线"
           hidden
         ></div>
 
-        <div class="chart-inspect ak-chart-inspect" id="access-keys-cache-inspect">
-          悬停、轻点或聚焦图表按左右方向键查看各时间分桶的缓存命中率。
+        <div class="chart-inspect ak-chart-inspect" id="access-keys-trend-inspect">
+          悬停、轻点或聚焦图表按左右方向键查看各时间分桶的明细。
         </div>
-        <p class="visually-hidden" id="access-keys-cache-live" aria-live="polite" aria-atomic="true"></p>
+        <p class="visually-hidden" id="access-keys-trend-live" aria-live="polite" aria-atomic="true"></p>
 
-        <div class="chart-stage" id="access-keys-cache-stage">
+        <div class="chart-stage" id="access-keys-trend-stage">
           <canvas
-            id="access-keys-cache-canvas"
+            id="access-keys-trend-canvas"
             class="trend-canvas trend-canvas--line"
             role="img"
-            aria-labelledby="heading-access-keys-cache-chart"
-            aria-describedby="access-keys-cache-inspect"
+            aria-labelledby="heading-access-keys-trend-chart access-keys-trend-selected-metric"
+            aria-describedby="access-keys-trend-inspect"
             tabindex="0"
             hidden
           ></canvas>
-          <div class="empty-state chart-empty" id="access-keys-cache-empty">正在加载缓存命中率趋势…</div>
+          <div class="empty-state chart-empty" id="access-keys-trend-empty">正在加载估算费用趋势…</div>
         </div>
 
-        <details class="bucket-details" id="access-keys-cache-details" hidden>
-          <summary class="bucket-summary">查看缓存命中率分桶明细</summary>
+        <details class="bucket-details" id="access-keys-trend-details" hidden>
+          <summary class="bucket-summary" id="access-keys-trend-details-summary">查看估算费用分桶明细</summary>
           <div
             class="table-scroll table-scroll--compact"
             role="region"
-            aria-label="AccessKey 缓存命中率分桶明细表"
+            aria-labelledby="access-keys-trend-table-caption"
             tabindex="0"
           >
-            <table class="data-table" id="access-keys-cache-table">
-              <caption class="visually-hidden">AccessKey 缓存命中率分桶明细</caption>
-              <thead id="access-keys-cache-table-head"></thead>
-              <tbody id="access-keys-cache-table-body"></tbody>
+            <table class="data-table" id="access-keys-trend-table">
+              <caption class="visually-hidden" id="access-keys-trend-table-caption">AccessKey 估算费用分桶明细</caption>
+              <thead id="access-keys-trend-table-head"></thead>
+              <tbody id="access-keys-trend-table-body"></tbody>
             </table>
           </div>
         </details>

@@ -1,9 +1,11 @@
 (function () {
   "use strict";
 
-  const RANGE_KEYS = ["24h", "today", "yesterday", "7d", "30d"];
+  const RANGE_KEYS = ["6h", "12h", "24h", "today", "yesterday", "7d", "30d"];
   const VALID_RANGES = new Set(RANGE_KEYS);
   const RANGE_LABELS = {
+    "6h": "近 6 小时",
+    "12h": "近 12 小时",
     "24h": "近 24 小时",
     today: "今天",
     yesterday: "昨天",
@@ -15,6 +17,12 @@
   const REFRESH_INTERVAL_MS = 60000;
   const RANKING_DEFAULT_LIMIT = 10;
   const ACCESS_KEY_PALETTE_SIZE = 12;
+  const ACCESS_KEY_TREND_METRICS = {
+    requests: { label: "请求数", read: (point) => toFiniteNum(point.request_count), format: formatCompactInt },
+    tokens: { label: "Token 用量", read: (point) => toFiniteNum(point.total_tokens), format: formatAccessKeyTokens },
+    cache: { label: "缓存率", read: (point) => toFiniteNum(point.cache_hit_rate), format: formatPercent },
+    cost: { label: "估算费用", read: (point) => parseNanoUsd(point.estimated_cost_nano_usd), format: formatAccessKeyTrendCost },
+  };
 
   function createRangeCache() {
     const cache = {};
@@ -54,7 +62,8 @@
       focusedIndex: -1,
       bars: [],
     },
-    accessKeyCacheChart: {
+    accessKeyTrend: {
+      metric: "cost",
       range: "24h",
       fromMs: null,
       toMs: null,
@@ -646,7 +655,7 @@
         emptyEl.hidden = false;
       }
       if (scrollEl) scrollEl.hidden = true;
-      renderAccessKeyCacheSection(activeRange, akState);
+      renderAccessKeyTrendSection(activeRange, akState);
       return;
     }
 
@@ -657,7 +666,7 @@
         emptyEl.hidden = false;
       }
       if (scrollEl) scrollEl.hidden = true;
-      renderAccessKeyCacheSection(activeRange, akState);
+      renderAccessKeyTrendSection(activeRange, akState);
       return;
     }
 
@@ -764,7 +773,7 @@
       }
     }
 
-    renderAccessKeyCacheSection(activeRange, akState);
+    renderAccessKeyTrendSection(activeRange, akState);
   }
 
   function sortAccessKeyRows() {
@@ -1345,6 +1354,7 @@
       const windows = snap && Array.isArray(snap.quota_windows) ? snap.quota_windows : [];
 
       const credId = cred.credential_id != null && cred.credential_id !== "" ? String(cred.credential_id) : "—";
+      const accountName = cred.display_name || `#${credId}`;
       const channelName = item.channel_name ? String(item.channel_name) : "未命名渠道";
       const planName = planSummary && planSummary.name ? String(planSummary.name) : "未识别套餐";
       const statusBadge = mapStatusBadge(cred.effective_status);
@@ -1395,7 +1405,7 @@
       const card = createEl("article", { className: "quota-item" }, [
         createEl("div", { className: "quota-item-header" }, [
           createEl("div", { className: "quota-identity" }, [
-            createEl("h3", { className: "quota-account measured", text: `订阅账号 #${credId}` }),
+            createEl("h3", { className: "quota-account measured", text: `订阅账号 ${accountName}` }),
             createEl("p", { className: "quota-channel", text: `渠道：${channelName}` }),
           ]),
           createEl("div", { className: "quota-badges" }, badges),
@@ -1834,7 +1844,7 @@
   }
 
   /* ------------------------------------------------------------------------
-     AccessKey Cache-Hit Trend Chart (Multi-Series Line, 0-100%, Gaps, Toggle)
+     AccessKey Usage Trend Chart
      ------------------------------------------------------------------------ */
 
   const ACCESS_KEY_FALLBACK_COLORS = [
@@ -1874,7 +1884,7 @@
 
   function assignAccessKeyColors(rows) {
     const assigned = new Set();
-    const previous = state.accessKeyCacheChart.colorByKeyId;
+    const previous = state.accessKeyTrend.colorByKeyId;
     const pending = [];
     for (const row of rows) {
       const color = previous.get(row.keyId);
@@ -1938,27 +1948,51 @@
     return "";
   }
 
-  function buildAccessKeyCacheChartModel(data, range) {
+  function formatAccessKeyTrendCost(value) {
+    if (value > 0 && value < 0.0001) return `$${value.toFixed(9).replace(/0+$/, "")}`;
+    return formatUsdAmount(value);
+  }
+
+  function formatAccessKeyTrendPoint(metric, point) {
+    const value = point?.value;
+    const text = value == null ? "无数据" : ACCESS_KEY_TREND_METRICS[metric].format(value);
+    return point?.pricingIncomplete ? `${text}（计价不全）` : text;
+  }
+
+  function getAccessKeyTrendCeiling(metric, series) {
+    if (metric === "cache") return 1;
+    let peak = 0;
+    for (const { points } of series) {
+      for (const point of points) peak = Math.max(peak, point?.value ?? 0);
+    }
+    const minimumStep = metric === "cost" ? 0.0001 : 1;
+    const step = 10 ** Math.floor(Math.log10(Math.max(peak / 4, minimumStep)));
+    return 4 * step * Math.max(1, Math.ceil(peak / (4 * step)));
+  }
+
+  function buildAccessKeyTrendChartModel(data, range, metric) {
     const items = data && Array.isArray(data.items) ? data.items : [];
     const eligibleRows = [];
     const bucketMap = new Map();
+    const { read } = ACCESS_KEY_TREND_METRICS[metric];
 
     for (const item of items) {
       if (!item || typeof item !== "object" || item.stale) continue;
-      if (!Array.isArray(item.cache_hit_series) || item.cache_hit_series.length === 0) continue;
+      if (!Array.isArray(item.series) || item.series.length === 0) continue;
 
       const pointsByStart = new Map();
       const rowBuckets = [];
       let hasValidPoint = false;
 
-      for (const pt of item.cache_hit_series) {
+      for (const pt of item.series) {
         if (!pt || typeof pt !== "object") continue;
         const startMs = toFiniteNum(pt.bucket_start_ms);
         if (startMs === null) continue;
         const endMs = toFiniteNum(pt.bucket_end_ms);
-        const rate = toFiniteNum(pt.cache_hit_rate);
-        if (rate !== null) hasValidPoint = true;
-        pointsByStart.set(startMs, rate);
+        const value = read(pt);
+        const pricingIncomplete = metric === "cost" && pt.pricing_incomplete === true;
+        if (value !== null || pricingIncomplete) hasValidPoint = true;
+        pointsByStart.set(startMs, { value, pricingIncomplete });
         rowBuckets.push({ startMs, endMs });
       }
 
@@ -1976,7 +2010,6 @@
       const keyId = hasId ? String(item.id) : name;
       eligibleRows.push({
         keyId,
-        id: item.id,
         name,
         deleted: Boolean(item.deleted),
         pointsByStart,
@@ -1987,11 +2020,10 @@
     assignAccessKeyColors(eligibleRows);
     const series = eligibleRows.map((row) => ({
       keyId: row.keyId,
-      id: row.id,
       name: row.name,
       deleted: row.deleted,
       colorIndex: row.colorIndex,
-      values: buckets.map((b) => (row.pointsByStart.has(b.startMs) ? row.pointsByStart.get(b.startMs) : null)),
+      points: buckets.map((b) => row.pointsByStart.get(b.startMs)),
     }));
 
     let bucketWidthMs = null;
@@ -2022,8 +2054,8 @@
     return { buckets, series, bucketWidthMs, isDay };
   }
 
-  function getVisibleAccessKeyCacheSeries() {
-    const chart = state.accessKeyCacheChart;
+  function getVisibleAccessKeyTrendSeries() {
+    const chart = state.accessKeyTrend;
     return chart.series.filter((s) => !chart.hiddenKeyIds.has(s.keyId));
   }
 
@@ -2042,17 +2074,17 @@
     return `${p.hour}:${p.minute}`;
   }
 
-  function setAccessKeyCacheLiveText(text) {
-    const liveEl = byId("access-keys-cache-live");
+  function setAccessKeyTrendLiveText(text) {
+    const liveEl = byId("access-keys-trend-live");
     if (!liveEl) return;
     liveEl.textContent = text || "";
   }
 
-  function renderAccessKeyCacheSection(activeRange, akState) {
-    const chart = state.accessKeyCacheChart;
+  function renderAccessKeyTrendSection(activeRange, akState) {
+    const chart = state.accessKeyTrend;
     const data = akState && akState.data ? akState.data : null;
     const model = data
-      ? buildAccessKeyCacheChartModel(data, activeRange)
+      ? buildAccessKeyTrendChartModel(data, activeRange, chart.metric)
       : { buckets: [], series: [], bucketWidthMs: null, isDay: activeRange === "30d" };
 
     const rangeChanged = chart.range !== activeRange;
@@ -2074,10 +2106,10 @@
     ) : -1;
     if (chart.focusedIndex < 0) {
       chart.interactionSource = null;
-      setAccessKeyCacheLiveText("");
+      setAccessKeyTrendLiveText("");
     }
 
-    const winLabelEl = byId("access-keys-cache-window-label");
+    const winLabelEl = byId("access-keys-trend-window-label");
     if (winLabelEl) {
       const { fromMs, toMs } = chart;
       if (fromMs !== null && toMs !== null && toMs >= fromMs) {
@@ -2089,15 +2121,15 @@
       }
     }
 
-    renderAccessKeyCacheLegend();
-    renderAccessKeyCacheChart(false);
-    renderAccessKeyCacheTable();
+    renderAccessKeyTrendLegend();
+    renderAccessKeyTrendChart(false);
+    renderAccessKeyTrendTable();
   }
 
-  function renderAccessKeyCacheLegend() {
-    const legendEl = byId("access-keys-cache-legend");
+  function renderAccessKeyTrendLegend() {
+    const legendEl = byId("access-keys-trend-legend");
     if (!legendEl) return;
-    const chart = state.accessKeyCacheChart;
+    const chart = state.accessKeyTrend;
 
     if (chart.series.length === 0) {
       clearChildren(legendEl);
@@ -2112,9 +2144,9 @@
       .join("\n");
 
     if (nextSignature === chart.legendSignature) {
-      const buttons = legendEl.querySelectorAll("button[data-cache-key-id]");
+      const buttons = legendEl.querySelectorAll("button[data-trend-key-id]");
       for (const btn of buttons) {
-        const isVisible = !chart.hiddenKeyIds.has(btn.dataset.cacheKeyId);
+        const isVisible = !chart.hiddenKeyIds.has(btn.dataset.trendKeyId);
         btn.setAttribute("aria-pressed", String(isVisible));
       }
       return;
@@ -2122,7 +2154,7 @@
 
     const activeEl = document.activeElement;
     const focusedKeyId = activeEl && legendEl.contains(activeEl) && activeEl.dataset
-      ? activeEl.dataset.cacheKeyId
+      ? activeEl.dataset.trendKeyId
       : null;
 
     clearChildren(legendEl);
@@ -2150,7 +2182,7 @@
           type: "button",
           "aria-pressed": String(isVisible),
         },
-        dataset: { cacheKeyId: s.keyId },
+        dataset: { trendKeyId: s.keyId },
       }, children);
       legendEl.appendChild(btn);
       if (focusedKeyId && s.keyId === focusedKeyId) {
@@ -2164,17 +2196,18 @@
     }
   }
 
-  function updateAccessKeyCacheInspect(visibleSeries, announceLive) {
-    const inspectEl = byId("access-keys-cache-inspect");
+  function updateAccessKeyTrendInspect(visibleSeries, announceLive) {
+    const inspectEl = byId("access-keys-trend-inspect");
     if (!inspectEl) return;
-    const chart = state.accessKeyCacheChart;
+    const chart = state.accessKeyTrend;
+    const { label } = ACCESS_KEY_TREND_METRICS[chart.metric];
     clearChildren(inspectEl);
 
     if (chart.series.length === 0 || chart.buckets.length === 0) {
       const akState = state.accessKeysByRange[state.range];
       const msg = state.isLoading && !(akState && akState.data)
-        ? `正在加载${rangeLabel(state.range)}缓存命中率分桶数据…`
-        : "该时间范围内暂无缓存命中率分桶数据。";
+        ? `正在加载${rangeLabel(state.range)}${label}分桶数据…`
+        : `该时间范围内暂无${label}分桶数据。`;
       inspectEl.textContent = msg;
       return;
     }
@@ -2182,7 +2215,7 @@
     if (visibleSeries.length === 0) {
       const msg = "已隐藏全部 AccessKey 曲线，点击上方图例可重新显示。";
       inspectEl.textContent = msg;
-      if (announceLive) setAccessKeyCacheLiveText(msg);
+      if (announceLive) setAccessKeyTrendLiveText(msg);
       return;
     }
 
@@ -2193,9 +2226,9 @@
       const liveParts = [];
 
       for (const s of visibleSeries) {
-        const val = s.values[activeIdx];
-        const hasVal = val !== null;
-        const valText = hasVal ? formatPercent(val) : "无数据";
+        const point = s.points[activeIdx];
+        const hasVal = point?.value != null;
+        const valText = formatAccessKeyTrendPoint(chart.metric, point);
         liveParts.push(`${s.name} ${valText}`);
         itemNodes.push(
           createEl("span", { className: "ak-inspect-item" }, [
@@ -2220,7 +2253,7 @@
       inspectEl.appendChild(createEl("span", { className: "ak-inspect-list" }, itemNodes));
 
       if (announceLive) {
-        setAccessKeyCacheLiveText(`${span}：${liveParts.join("，")}`);
+        setAccessKeyTrendLiveText(`${label} ${span}：${liveParts.join("，")}`);
       }
       return;
     }
@@ -2229,14 +2262,15 @@
       `共 ${chart.buckets.length} 个时间分桶，显示 ${visibleSeries.length}/${chart.series.length} 条曲线（悬停、轻点或聚焦图表按左右方向键查看明细）。`;
   }
 
-  function renderAccessKeyCacheChart(announceLive) {
-    const canvas = byId("access-keys-cache-canvas");
-    const emptyEl = byId("access-keys-cache-empty");
+  function renderAccessKeyTrendChart(announceLive) {
+    const canvas = byId("access-keys-trend-canvas");
+    const emptyEl = byId("access-keys-trend-empty");
     if (!canvas) return;
 
-    const chart = state.accessKeyCacheChart;
-    const visibleSeries = getVisibleAccessKeyCacheSeries();
-    updateAccessKeyCacheInspect(visibleSeries, Boolean(announceLive));
+    const chart = state.accessKeyTrend;
+    const metric = ACCESS_KEY_TREND_METRICS[chart.metric];
+    const visibleSeries = getVisibleAccessKeyTrendSeries();
+    updateAccessKeyTrendInspect(visibleSeries, Boolean(announceLive));
 
     if (chart.series.length === 0 || chart.buckets.length === 0) {
       canvas.hidden = true;
@@ -2244,8 +2278,8 @@
         const akState = state.accessKeysByRange[state.range];
         const hasErr = Boolean((akState && akState.error) || state.globalError);
         emptyEl.textContent = state.isLoading && !(akState && akState.data)
-          ? `正在加载${rangeLabel(state.range)}缓存命中率趋势…`
-          : (hasErr && !(akState && akState.data) ? "缓存命中率趋势加载失败" : "该时间范围内暂无缓存命中率趋势数据");
+          ? `正在加载${rangeLabel(state.range)}${metric.label}趋势…`
+          : (hasErr && !(akState && akState.data) ? `${metric.label}趋势加载失败` : `该时间范围内暂无${metric.label}趋势数据`);
         emptyEl.hidden = false;
       }
       chart.pointsX = [];
@@ -2283,13 +2317,17 @@
     ctx.clearRect(0, 0, cssWidth, cssHeight);
 
     const colors = getAccessKeyChartColors();
-    const padLeft = 42;
+    const ceiling = getAccessKeyTrendCeiling(chart.metric, visibleSeries);
+    const yTicks = Array.from({ length: 5 }, (_, index) => metric.format(ceiling * (1 - index / 4)));
+    ctx.font = `11px ${colors.monoFont}`;
+    const padLeft = Math.max(42, ...yTicks.map((label) => Math.ceil(ctx.measureText(label).width) + 12));
     const padRight = 12;
     const padTop = 12;
     const padBottom = 28;
     const plotW = Math.max(10, cssWidth - padLeft - padRight);
     const plotH = Math.max(10, cssHeight - padTop - padBottom);
     const baseY = padTop + plotH;
+    const yFor = (value) => baseY - plotH * Math.max(0, Math.min(1, value / ceiling));
 
     const count = chart.buckets.length;
     const spanMs = chart.toMs - chart.fromMs;
@@ -2302,12 +2340,10 @@
     chart.plotLeft = padLeft;
     chart.plotRight = cssWidth - padRight;
 
-    // Fixed 0-100% horizontal dashed gridlines & Y-axis ticks (0/25/50/75/100)
-    ctx.font = `11px ${colors.monoFont}`;
+    // Horizontal grid and metric-specific axis labels
     ctx.textAlign = "right";
     ctx.textBaseline = "middle";
     ctx.lineWidth = 1;
-    const yTicks = [100, 75, 50, 25, 0];
 
     for (let i = 0; i < yTicks.length; i++) {
       const ratio = i / (yTicks.length - 1);
@@ -2321,7 +2357,7 @@
       ctx.stroke();
 
       ctx.fillStyle = colors.axisText;
-      ctx.fillText(`${yTicks[i]}%`, padLeft - 8, y);
+      ctx.fillText(yTicks[i], padLeft - 8, y);
     }
     ctx.setLineDash([]);
 
@@ -2350,14 +2386,13 @@
 
       let inSegment = false;
       for (let i = 0; i < count; i++) {
-        const val = s.values[i];
-        if (val === null) {
+        const val = s.points[i]?.value;
+        if (val == null) {
           inSegment = false;
           continue;
         }
-        const clamped = Math.max(0, Math.min(1, val));
         const x = pointsX[i];
-        const y = padTop + plotH * (1 - clamped);
+        const y = yFor(val);
         if (!inSegment) {
           ctx.moveTo(x, y);
           inSegment = true;
@@ -2368,17 +2403,16 @@
       ctx.stroke();
     }
 
-    // Draw point markers for all valid buckets (including isolated single buckets and 0%)
+    // Draw point markers, including isolated buckets and zero values.
     const baseRadius = count > 36 ? 2.25 : 2.75;
     for (const s of visibleSeries) {
       const fillColor = colors.palette[s.colorIndex % colors.palette.length];
       for (let i = 0; i < count; i++) {
-        const val = s.values[i];
-        if (val === null) continue;
-        const clamped = Math.max(0, Math.min(1, val));
+        const val = s.points[i]?.value;
+        if (val == null) continue;
         const x = pointsX[i];
-        const y = padTop + plotH * (1 - clamped);
-        const isIsolated = (i === 0 || s.values[i - 1] === null) && (i === count - 1 || s.values[i + 1] === null);
+        const y = yFor(val);
+        const isIsolated = s.points[i - 1]?.value == null && s.points[i + 1]?.value == null;
         const isActive = i === activeIdx;
         const r = isActive ? 4.5 : (isIsolated ? 3.5 : baseRadius);
 
@@ -2434,13 +2468,13 @@
     ctx.restore();
   }
 
-  function renderAccessKeyCacheTable() {
-    const detailsEl = byId("access-keys-cache-details");
-    const thead = byId("access-keys-cache-table-head");
-    const tbody = byId("access-keys-cache-table-body");
+  function renderAccessKeyTrendTable() {
+    const detailsEl = byId("access-keys-trend-details");
+    const thead = byId("access-keys-trend-table-head");
+    const tbody = byId("access-keys-trend-table-body");
     if (!detailsEl || !thead || !tbody) return;
 
-    const chart = state.accessKeyCacheChart;
+    const chart = state.accessKeyTrend;
     if (chart.series.length === 0 || chart.buckets.length === 0) {
       detailsEl.hidden = true;
       return;
@@ -2450,7 +2484,7 @@
     if (!detailsEl.open) return;
     clearChildren(thead);
     clearChildren(tbody);
-    const visibleSeries = getVisibleAccessKeyCacheSeries();
+    const visibleSeries = getVisibleAccessKeyTrendSeries();
 
     if (visibleSeries.length === 0) {
       thead.appendChild(
@@ -2489,12 +2523,11 @@
         }),
       ];
       for (const s of visibleSeries) {
-        const val = s.values[i];
-        const hasVal = val !== null;
+        const point = s.points[i];
         rowCells.push(
           createEl("td", {
-            className: hasVal ? "num" : "num text-muted",
-            text: hasVal ? formatPercent(val) : "无数据",
+            className: point?.value != null ? "num" : "num text-muted",
+            text: formatAccessKeyTrendPoint(chart.metric, point),
           })
         );
       }
@@ -2503,7 +2536,7 @@
   }
 
   function findAccessKeyChartIndexAtClientX(canvas, clientX) {
-    const chart = state.accessKeyCacheChart;
+    const chart = state.accessKeyTrend;
     const pointsX = chart.pointsX;
     if (!pointsX || pointsX.length === 0) return -1;
     const rect = canvas.getBoundingClientRect();
@@ -2815,17 +2848,40 @@
       }
     }
 
-    // AccessKey cache-hit chart legend toggles, pointer/tap & keyboard inspection
-    const akLegend = byId("access-keys-cache-legend");
+    const metricGroup = byId("access-keys-trend-metrics");
+    if (metricGroup) {
+      const buttons = metricGroup.querySelectorAll("button[data-metric]");
+      for (const button of buttons) {
+        button.addEventListener("click", function () {
+          const { metric } = button.dataset;
+          const chart = state.accessKeyTrend;
+          if (chart.metric === metric) return;
+
+          chart.metric = metric;
+          for (const control of buttons) {
+            control.setAttribute("aria-pressed", String(control === button));
+          }
+          const { label } = ACCESS_KEY_TREND_METRICS[metric];
+          byId("access-keys-trend-selected-metric").textContent = label;
+          byId("access-keys-trend-details-summary").textContent = `查看${label}分桶明细`;
+          byId("access-keys-trend-table-caption").textContent = `AccessKey ${label}分桶明细`;
+          setAccessKeyTrendLiveText("");
+          renderAccessKeyTrendSection(state.range, state.accessKeysByRange[state.range]);
+        });
+      }
+    }
+
+    // AccessKey trend legend toggles and chart inspection.
+    const akLegend = byId("access-keys-trend-legend");
     if (akLegend) {
       akLegend.addEventListener("click", function (ev) {
         const btn = ev.target && typeof ev.target.closest === "function"
-          ? ev.target.closest("button[data-cache-key-id]")
+          ? ev.target.closest("button[data-trend-key-id]")
           : null;
         if (!btn) return;
-        const keyId = btn.dataset.cacheKeyId;
+        const keyId = btn.dataset.trendKeyId;
         if (!keyId) return;
-        const chart = state.accessKeyCacheChart;
+        const chart = state.accessKeyTrend;
         if (chart.hiddenKeyIds.has(keyId)) {
           chart.hiddenKeyIds.delete(keyId);
           btn.setAttribute("aria-pressed", "true");
@@ -2833,38 +2889,38 @@
           chart.hiddenKeyIds.add(keyId);
           btn.setAttribute("aria-pressed", "false");
         }
-        const visibleAfter = getVisibleAccessKeyCacheSeries();
+        const visibleAfter = getVisibleAccessKeyTrendSeries();
         if (visibleAfter.length === 0) {
           chart.hoveredIndex = -1;
           chart.focusedIndex = -1;
           chart.interactionSource = null;
-          renderAccessKeyCacheChart(true);
+          renderAccessKeyTrendChart(true);
         } else {
-          renderAccessKeyCacheChart(false);
+          renderAccessKeyTrendChart(false);
         }
-        renderAccessKeyCacheTable();
+        renderAccessKeyTrendTable();
       });
     }
 
-    const akDetails = byId("access-keys-cache-details");
-    if (akDetails) akDetails.addEventListener("toggle", renderAccessKeyCacheTable);
+    const akDetails = byId("access-keys-trend-details");
+    if (akDetails) akDetails.addEventListener("toggle", renderAccessKeyTrendTable);
 
-    const akCanvas = byId("access-keys-cache-canvas");
+    const akCanvas = byId("access-keys-trend-canvas");
     if (akCanvas) {
       akCanvas.addEventListener("pointermove", function (ev) {
         if (ev.pointerType === "touch") return;
         const idx = findAccessKeyChartIndexAtClientX(akCanvas, ev.clientX);
-        if (idx !== state.accessKeyCacheChart.hoveredIndex) {
-          state.accessKeyCacheChart.hoveredIndex = idx;
-          renderAccessKeyCacheChart(false);
+        if (idx !== state.accessKeyTrend.hoveredIndex) {
+          state.accessKeyTrend.hoveredIndex = idx;
+          renderAccessKeyTrendChart(false);
         }
       });
 
       akCanvas.addEventListener("pointerleave", function (ev) {
         if (ev.pointerType === "touch") return;
-        if (state.accessKeyCacheChart.hoveredIndex !== -1) {
-          state.accessKeyCacheChart.hoveredIndex = -1;
-          renderAccessKeyCacheChart(false);
+        if (state.accessKeyTrend.hoveredIndex !== -1) {
+          state.accessKeyTrend.hoveredIndex = -1;
+          renderAccessKeyTrendChart(false);
         }
       });
 
@@ -2872,69 +2928,69 @@
         if (ev.pointerType === "mouse" && ev.button !== 0) return;
         const idx = findAccessKeyChartIndexAtClientX(akCanvas, ev.clientX);
         if (idx < 0) return;
-        const chart = state.accessKeyCacheChart;
+        const chart = state.accessKeyTrend;
         chart.focusedIndex = idx;
         chart.interactionSource = "tap";
         if (ev.pointerType !== "mouse") {
           chart.hoveredIndex = -1;
         }
-        renderAccessKeyCacheChart(true);
+        renderAccessKeyTrendChart(true);
       });
 
       akCanvas.addEventListener("keydown", function (ev) {
-        const chart = state.accessKeyCacheChart;
+        const chart = state.accessKeyTrend;
         const len = chart.buckets.length;
-        if (len === 0 || getVisibleAccessKeyCacheSeries().length === 0) return;
+        if (len === 0 || getVisibleAccessKeyTrendSeries().length === 0) return;
         if (ev.key === "ArrowRight") {
           ev.preventDefault();
           chart.hoveredIndex = -1;
           chart.focusedIndex = chart.focusedIndex < 0 ? 0 : Math.min(len - 1, chart.focusedIndex + 1);
           chart.interactionSource = "keyboard";
-          renderAccessKeyCacheChart(true);
+          renderAccessKeyTrendChart(true);
         } else if (ev.key === "ArrowLeft") {
           ev.preventDefault();
           chart.hoveredIndex = -1;
           chart.focusedIndex = chart.focusedIndex < 0 ? len - 1 : Math.max(0, chart.focusedIndex - 1);
           chart.interactionSource = "keyboard";
-          renderAccessKeyCacheChart(true);
+          renderAccessKeyTrendChart(true);
         } else if (ev.key === "Home") {
           ev.preventDefault();
           chart.hoveredIndex = -1;
           chart.focusedIndex = 0;
           chart.interactionSource = "keyboard";
-          renderAccessKeyCacheChart(true);
+          renderAccessKeyTrendChart(true);
         } else if (ev.key === "End") {
           ev.preventDefault();
           chart.hoveredIndex = -1;
           chart.focusedIndex = len - 1;
           chart.interactionSource = "keyboard";
-          renderAccessKeyCacheChart(true);
+          renderAccessKeyTrendChart(true);
         } else if (ev.key === "Escape") {
           if (chart.focusedIndex !== -1) {
             chart.focusedIndex = -1;
             chart.interactionSource = null;
-            renderAccessKeyCacheChart(false);
+            renderAccessKeyTrendChart(false);
           }
         }
       });
 
       akCanvas.addEventListener("blur", function () {
-        const chart = state.accessKeyCacheChart;
+        const chart = state.accessKeyTrend;
         if (chart.interactionSource === "keyboard" && chart.focusedIndex !== -1) {
           chart.focusedIndex = -1;
           chart.interactionSource = null;
-          renderAccessKeyCacheChart(false);
+          renderAccessKeyTrendChart(false);
         }
       });
 
       if (typeof ResizeObserver === "function") {
         const akRo = new ResizeObserver(function () {
-          renderAccessKeyCacheChart(false);
+          renderAccessKeyTrendChart(false);
         });
         akRo.observe(akCanvas);
       } else {
         window.addEventListener("resize", function () {
-          renderAccessKeyCacheChart(false);
+          renderAccessKeyTrendChart(false);
         });
       }
     }

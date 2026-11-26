@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -42,7 +43,7 @@ func (a *app) dashboard(w http.ResponseWriter, r *http.Request) {
 	switch rangeValue {
 	case "":
 		rangeValue = "24h"
-	case "24h", "today", "yesterday", "7d", "30d":
+	case "6h", "12h", "24h", "today", "yesterday", "7d", "30d":
 	default:
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请选择有效的统计时间范围。"})
 		return
@@ -199,11 +200,14 @@ type subscription struct {
 	GroupCount          int    `json:"group_count"`
 	AvailableGroupCount int    `json:"available_group_count"`
 	credentialKey       string
-	Credential          struct {
-		ID              int64        `json:"credential_id"`
-		EffectiveStatus string       `json:"effective_status"`
-		Observation     *observation `json:"observation,omitempty"`
-	} `json:"credential"`
+	Credential          subscriptionCredential `json:"credential"`
+}
+
+type subscriptionCredential struct {
+	ID              int64        `json:"credential_id"`
+	DisplayName     string       `json:"display_name,omitempty"`
+	EffectiveStatus string       `json:"effective_status"`
+	Observation     *observation `json:"observation,omitempty"`
 }
 
 func (s *subscription) UnmarshalJSON(data []byte) error {
@@ -211,12 +215,38 @@ func (s *subscription) UnmarshalJSON(data []byte) error {
 	wire := struct {
 		*wireSubscription
 		CredentialKey string `json:"credential_key"`
+		Credential    struct {
+			subscriptionCredential
+			Name    string `json:"name"`
+			Account struct {
+				EmailMask string `json:"email_mask"`
+			} `json:"account"`
+		} `json:"credential"`
 	}{wireSubscription: (*wireSubscription)(s)}
 	if err := json.Unmarshal(data, &wire); err != nil {
 		return err
 	}
 	s.credentialKey = wire.CredentialKey
+	s.Credential = wire.Credential.subscriptionCredential
+	s.Credential.DisplayName = maskSubscriptionName(wire.Credential.Name)
+	if s.Credential.DisplayName == "" {
+		s.Credential.DisplayName = strings.TrimSpace(wire.Credential.Account.EmailMask)
+	}
 	return nil
+}
+
+func maskSubscriptionName(name string) string {
+	chars := []rune(strings.TrimSpace(name))
+	switch len(chars) {
+	case 0:
+		return ""
+	case 1:
+		return "***"
+	case 2:
+		return string(chars[0]) + "***"
+	default:
+		return string(chars[0]) + "***" + string(chars[len(chars)-1])
+	}
 }
 
 type observation struct {

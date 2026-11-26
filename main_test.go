@@ -32,7 +32,11 @@ func TestDashboardAccessAndPartialFailure(t *testing.T) {
 		case "/api/access-keys/options":
 			data = `[]`
 		case "/api/home/subscription-accounts":
-			data = `{"items":[{"credential_key":"private-detail","credential":{"credential_id":5,"account":{"email":"private-detail"}}}]}`
+			data = `{"items":[
+				{"credential_key":"private-detail","credential":{"credential_id":5,"name":" 中文测试号 ","account":{"email_mask":"a***z@example.net"}}},
+				{"credential":{"credential_id":6,"name":" ","account":{"email":"private-user@example.com","email_mask":"p***r@example.com"}}},
+				{"credential":{"credential_id":7,"account":{"email":"private-detail"}}}
+			]}`
 		case "/api/usage":
 			from, _ := strconv.ParseInt(r.URL.Query().Get("from_ms"), 10, 64)
 			to, _ := strconv.ParseInt(r.URL.Query().Get("to_ms"), 10, 64)
@@ -84,9 +88,14 @@ func TestDashboardAccessAndPartialFailure(t *testing.T) {
 	if w := request(http.MethodGet, "/api/dashboard?range=day", "", cookie); w.Code != http.StatusBadRequest {
 		t.Fatalf("invalid range: status %d", w.Code)
 	}
-	for _, tc := range []struct{ period, want string }{
-		{"24h", `"request_count":15`},
-		{"30d", "用量统计暂时无法更新"},
+	for _, tc := range []struct {
+		period, want string
+		hours        int
+	}{
+		{"6h", `"request_count":15`, 6},
+		{"12h", `"request_count":15`, 12},
+		{"", `"range":"24h"`, 24},
+		{"30d", "用量统计暂时无法更新", 0},
 	} {
 		w := request(http.MethodGet, "/api/dashboard?range="+tc.period, "", cookie)
 		body := w.Body.String()
@@ -98,17 +107,42 @@ func TestDashboardAccessAndPartialFailure(t *testing.T) {
 				t.Errorf("range %s response missing %q", tc.period, want)
 			}
 		}
-		if strings.Contains(body, "private-detail") || strings.Contains(body, upstreamKey) {
-			t.Errorf("range %s exposed private data", tc.period)
+		for _, private := range []string{"private-detail", upstreamKey, "中文测试号", "private-user@example.com", "a***z@example.net"} {
+			if strings.Contains(body, private) {
+				t.Errorf("range %s exposed data outside the dashboard projection", tc.period)
+			}
 		}
-		if tc.period == "24h" {
+		if tc.period == "" {
+			var result struct {
+				Quota section[struct {
+					Items []struct {
+						Credential subscriptionCredential `json:"credential"`
+					} `json:"items"`
+				}] `json:"quota"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.Quota.Data == nil || len(result.Quota.Data.Items) != 3 {
+				t.Fatal("dashboard should contain three quota items")
+			}
+			for i, want := range []string{"中***号", "p***r@example.com", ""} {
+				if credential := result.Quota.Data.Items[i].Credential; credential.DisplayName != want {
+					t.Errorf("credential %d: display name does not match the masked value", credential.ID)
+				}
+			}
+		}
+		if tc.hours > 0 {
 			var result dashboardResponse
 			if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
 				t.Fatal(err)
 			}
 			data := result.Usage.Data
 			if data == nil || len(data.Series) == 0 || data.Series[0].Requests != 15 || data.Series[0].Start != data.From {
-				t.Error("the trend lost the requests from the clipped first bucket")
+				t.Fatalf("range %q lost the requests from the clipped first bucket", tc.period)
+			}
+			if span := time.Duration(data.To-data.From) * time.Millisecond; span != time.Duration(tc.hours)*time.Hour {
+				t.Errorf("range %q spans %s, want %d hours", tc.period, span, tc.hours)
 			}
 		}
 	}
@@ -157,13 +191,15 @@ func TestDashboardQuotaAndAccessKeyWindow(t *testing.T) {
 							"cache_write_5m_tokens":5,"cache_write_1h_tokens":3,"cache_write_unknown_tokens":2,
 							"estimated_cost_nano_usd":"2400000000","unpriced_request_count":1},
 						"series":[
-							{"bucket_start_ms":%d,"uncached_input_tokens":25,"cache_read_tokens":60,
+							{"bucket_start_ms":%d,"request_count":3,"total_tokens":2000,"estimated_cost_nano_usd":"2400000000",
+								"pricing_partial_count":1,"uncached_input_tokens":25,"cache_read_tokens":60,
 								"cache_write_5m_tokens":5,"cache_write_1h_tokens":3,"cache_write_unknown_tokens":2},
-							{"bucket_start_ms":%d,"uncached_input_tokens":25}
+							{"bucket_start_ms":%d,"request_count":1,"total_tokens":0,"estimated_cost_nano_usd":"0",
+								"unpriced_request_count":1,"usage_missing_count":1,"uncached_input_tokens":25}
 						]
 					}`, yesterday.UnixMilli(), yesterday.Add(2*time.Hour).UnixMilli())
 				case "4":
-					data = fmt.Sprintf(`{"bucket_width_ms":3600000,"summary":{"request_count":1,"cache_read_tokens":100,"estimated_cost_nano_usd":"1000000000"},"series":[{"bucket_start_ms":%d,"cache_read_tokens":100}]}`, yesterday.Add(time.Hour).UnixMilli())
+					data = fmt.Sprintf(`{"bucket_width_ms":3600000,"summary":{"request_count":1,"cache_read_tokens":100,"estimated_cost_nano_usd":"1000000000"},"series":[{"bucket_start_ms":%d,"request_count":1,"total_tokens":100,"cache_read_tokens":100,"estimated_cost_nano_usd":"1000000000"}]}`, yesterday.Add(time.Hour).UnixMilli())
 				case "":
 					data = `{"summary":{"estimated_cost_nano_usd":"0"},"distributions":{"access_key":{"requests":{"items":[{"access_key_id":4}]}}}}`
 				}
@@ -245,9 +281,9 @@ func TestDashboardQuotaAndAccessKeyWindow(t *testing.T) {
 		{0, []any{60.0 / 95.0, nil, float64(0)}},
 		{1, []any{nil, float64(1), nil}},
 	} {
-		points, ok := items[tc.index]["cache_hit_series"].([]any)
+		points, ok := items[tc.index]["series"].([]any)
 		if !ok || len(points) != 24 {
-			t.Fatalf("AccessKey %v has no aligned cache hit series", items[tc.index]["id"])
+			t.Fatalf("AccessKey %v has no aligned usage series", items[tc.index]["id"])
 		}
 		for hour, want := range tc.rates {
 			point := points[hour].(map[string]any)
@@ -259,7 +295,20 @@ func TestDashboardQuotaAndAccessKeyWindow(t *testing.T) {
 			}
 		}
 	}
-	if _, exists := items[2]["cache_hit_series"]; exists {
-		t.Error("idle AccessKey should have no cache series")
+	points := items[0]["series"].([]any)
+	for hour, want := range []map[string]any{
+		{"request_count": float64(3), "total_tokens": float64(2000), "estimated_cost_nano_usd": "2400000000", "pricing_incomplete": true},
+		{"request_count": float64(0), "total_tokens": float64(0), "estimated_cost_nano_usd": "0"},
+		{"request_count": float64(1), "total_tokens": nil, "estimated_cost_nano_usd": nil, "pricing_incomplete": true},
+	} {
+		point := points[hour].(map[string]any)
+		for field, value := range want {
+			if point[field] != value {
+				t.Errorf("AccessKey hour %d %s: got %v, want %v", hour, field, point[field], value)
+			}
+		}
+	}
+	if _, exists := items[2]["series"]; exists {
+		t.Error("idle AccessKey should have no series")
 	}
 }
