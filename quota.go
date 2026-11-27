@@ -1,105 +1,445 @@
 package main
 
 import (
+	"cmp"
 	"context"
+	"fmt"
 	"math"
 	"net/url"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
-const weekSeconds = 7 * 24 * 60 * 60
+const (
+	weekSeconds        = 7 * 24 * 60 * 60
+	credentialPageSize = 100
+	maxCredentialPages = 1000
+)
 
-func (u upstream) enrichQuota(ctx context.Context, quota *quotaData, health *healthData, now time.Time) {
-	var accounts sync.WaitGroup
-	for i := range quota.Items {
-		accounts.Go(func() {
-			account := &quota.Items[i]
-			observation := account.Credential.Observation
-			if observation == nil || observation.Snapshot == nil || len(observation.Snapshot.Windows) == 0 {
-				return
-			}
-			ids := u.subscriptionCredentials(ctx, account, health)
-			for i := range observation.Snapshot.Windows {
-				window := &observation.Snapshot.Windows[i]
-				if window.ResetAt == nil || *window.ResetAt <= 0 || window.Seconds <= 0 || window.Seconds > 31*24*60*60 {
-					continue
-				}
-				reset := time.UnixMilli(*window.ResetAt)
-				start := reset.Add(-time.Duration(window.Seconds) * time.Second)
-				safeLevel := quotaSafeLevel(start, reset, now, window.Seconds == weekSeconds)
-				window.SafeLevel = &safeLevel
-				span := usageSpan{start.UnixMilli(), min(*window.ResetAt, observation.ObservedAt)}
-				if window.Unit == "percent" && (window.Scope == "" || window.Scope == "account") && span.to > span.from {
-					u.loadQuotaAmounts(ctx, window, ids, span)
-				}
-			}
-		})
-	}
-	accounts.Wait()
+type subscriptionSnapshot struct {
+	Data        quotaData
+	Memberships []subscriptionCredentialLink
 }
 
-func (u upstream) subscriptionCredentials(ctx context.Context, account *subscription, health *healthData) []int64 {
-	primary := account.Credential.ID
-	if primary <= 0 {
-		return nil
-	}
-	if account.GroupCount <= 1 {
-		return []int64{primary}
-	}
-	if health == nil || len(health.Groups) < account.GroupCount || account.credentialKey == "" {
-		return nil
+type subscriptionCredentialLink struct {
+	GroupID       int64
+	CredentialID  int64
+	CurrentWeight *int
+	Observation   *observation
+}
+
+type accountKey struct {
+	channel      string
+	email        string
+	credentialID int64
+}
+
+type upstreamModernGroups struct {
+	ObservedAt int64 `json:"observed_at_ms"`
+	Items      []struct {
+		ID             int64  `json:"id"`
+		Name           string `json:"name"`
+		ChannelID      string `json:"channel_id"`
+		ChannelName    string `json:"channel_name"`
+		ConnectionType string `json:"connection_type"`
+		Enabled        bool   `json:"enabled"`
+	} `json:"items"`
+}
+
+type upstreamGroupCredentials struct {
+	ObservedAt int64                `json:"observed_at_ms"`
+	Items      []upstreamCredential `json:"items"`
+	Pagination struct {
+		Page       int `json:"page"`
+		PageSize   int `json:"page_size"`
+		TotalItems int `json:"total_items"`
+		TotalPages int `json:"total_pages"`
+	} `json:"pagination"`
+}
+
+type upstreamCredential struct {
+	ID               int64  `json:"credential_id"`
+	Name             string `json:"name"`
+	ConfiguredStatus string `json:"configured_status"`
+	EffectiveStatus  string `json:"effective_status"`
+	Weight           *int   `json:"weight"`
+	WeightManual     *int   `json:"weight_manual"`
+	Account          struct {
+		Email     string `json:"email"`
+		EmailMask string `json:"email_mask"`
+	} `json:"account"`
+	Observation *upstreamObservation `json:"observation"`
+}
+
+type upstreamObservation struct {
+	State      string `json:"state"`
+	ObservedAt int64  `json:"observed_at_ms"`
+	Snapshot   *struct {
+		Plan *struct {
+			Name string `json:"name"`
+		} `json:"plan_summary"`
+		Account *struct {
+			Email string `json:"email"`
+		} `json:"account_summary"`
+		Windows []quotaWindow `json:"quota_windows"`
+	} `json:"snapshot"`
+}
+
+type activeCredentialMember struct {
+	groupID       int64
+	cred          upstreamCredential
+	currentWeight *int
+}
+
+type aggregatedSubscriptionAccount struct {
+	key           accountKey
+	channelName   string
+	allIDs        []int64
+	seenAllIDs    map[int64]bool
+	activeMembers []activeCredentialMember
+}
+
+type preparedSubscriptionAccount struct {
+	item   subscription
+	allIDs []int64
+	links  []subscriptionCredentialLink
+}
+
+func (u upstream) loadSubscriptionSnapshot(ctx context.Context, now time.Time) (subscriptionSnapshot, error) {
+	groupsResp, err := fetchUpstream[upstreamModernGroups](ctx, u, "/api/modern/groups")
+	if err != nil {
+		return subscriptionSnapshot{}, err
 	}
 
-	matches := make([][]int64, len(health.Groups))
-	var groups sync.WaitGroup
-	for i, group := range health.Groups {
-		if group.ID <= 0 {
+	type groupResult struct {
+		enabled     bool
+		channelKey  string
+		channelName string
+		groupID     int64
+		observedAt  int64
+		items       []upstreamCredential
+		err         error
+	}
+
+	var subGroups []groupResult
+	for _, g := range groupsResp.Items {
+		if g.ID <= 0 || !strings.EqualFold(strings.TrimSpace(g.ConnectionType), "subscription") {
 			continue
 		}
-		groups.Go(func() {
-			query := url.Values{"credential_key": {account.credentialKey}}
-			path := "/api/modern/groups/" + strconv.FormatInt(group.ID, 10) + "/credentials?" + query.Encode()
-			data, err := fetchUpstream[struct {
-				Items []struct {
-					ID int64 `json:"credential_id"`
-				} `json:"items"`
-			}](ctx, u, path)
-			if err != nil {
-				return
-			}
-			for _, item := range data.Items {
-				if item.ID > 0 {
-					matches[i] = append(matches[i], item.ID)
-				}
-			}
+		channelKey := strings.ToLower(strings.TrimSpace(g.ChannelID))
+		if channelKey == "" {
+			channelKey = strings.ToLower(strings.TrimSpace(g.ChannelName))
+		}
+		channelName := strings.TrimSpace(g.ChannelName)
+		if channelName == "" {
+			channelName = strings.TrimSpace(g.ChannelID)
+		}
+		subGroups = append(subGroups, groupResult{
+			enabled:     g.Enabled,
+			channelKey:  channelKey,
+			channelName: channelName,
+			groupID:     g.ID,
 		})
 	}
-	groups.Wait()
-	seen := make(map[int64]bool)
-	var ids []int64
-	matchedGroups := 0
-	for _, group := range matches {
-		if len(group) > 0 {
-			matchedGroups++
+
+	var wg sync.WaitGroup
+	for i := range subGroups {
+		wg.Go(func() {
+			items, obsAt, fetchErr := u.fetchGroupCredentialsAllPages(ctx, subGroups[i].groupID)
+			subGroups[i].items = items
+			subGroups[i].observedAt = obsAt
+			subGroups[i].err = fetchErr
+		})
+	}
+	wg.Wait()
+
+	observedAtMS := groupsResp.ObservedAt
+	accountsByKey := make(map[accountKey]*aggregatedSubscriptionAccount)
+	for _, g := range subGroups {
+		if g.err != nil {
+			return subscriptionSnapshot{}, g.err
 		}
-		for _, id := range group {
-			if !seen[id] {
-				ids = append(ids, id)
-				seen[id] = true
+		observedAtMS = max(observedAtMS, g.observedAt)
+		for _, cred := range g.items {
+			if cred.ID <= 0 {
+				continue
+			}
+			key := subscriptionAccountKey(g.channelKey, cred)
+			acc := accountsByKey[key]
+			if acc == nil {
+				acc = &aggregatedSubscriptionAccount{
+					key:         key,
+					channelName: g.channelName,
+					seenAllIDs:  make(map[int64]bool),
+				}
+				accountsByKey[key] = acc
+			} else if acc.channelName == "" && g.channelName != "" {
+				acc.channelName = g.channelName
+			}
+			if !acc.seenAllIDs[cred.ID] {
+				acc.seenAllIDs[cred.ID] = true
+				acc.allIDs = append(acc.allIDs, cred.ID)
+			}
+			if g.enabled && isCredentialActive(cred.ConfiguredStatus, cred.EffectiveStatus) {
+				acc.activeMembers = append(acc.activeMembers, activeCredentialMember{
+					groupID:       g.groupID,
+					cred:          cred,
+					currentWeight: resolveCredentialWeight(cred.Weight, cred.WeightManual),
+				})
 			}
 		}
 	}
-	if matchedGroups != account.GroupCount || !seen[primary] {
+
+	prepared := make([]preparedSubscriptionAccount, 0, len(accountsByKey))
+	for _, acc := range accountsByKey {
+		if len(acc.activeMembers) == 0 {
+			continue
+		}
+		prepared = append(prepared, buildPreparedSubscriptionAccount(acc))
+	}
+	slices.SortFunc(prepared, func(a, b preparedSubscriptionAccount) int {
+		if c := cmp.Compare(a.item.ChannelName, b.item.ChannelName); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.item.Credential.DisplayName, b.item.Credential.DisplayName); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.item.Credential.ID, b.item.Credential.ID)
+	})
+
+	snapshot := subscriptionSnapshot{
+		Data: quotaData{
+			ObservedAt: observedAtMS,
+			Items:      make([]subscription, len(prepared)),
+		},
+	}
+	for i := range prepared {
+		snapshot.Data.Items[i] = prepared[i].item
+		for _, link := range prepared[i].links {
+			link.Observation = snapshot.Data.Items[i].Credential.Observation
+			snapshot.Memberships = append(snapshot.Memberships, link)
+		}
+	}
+	slices.SortFunc(snapshot.Memberships, func(a, b subscriptionCredentialLink) int {
+		if c := cmp.Compare(a.GroupID, b.GroupID); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.CredentialID, b.CredentialID)
+	})
+
+	var enrichGroup sync.WaitGroup
+	for i := range snapshot.Data.Items {
+		enrichGroup.Go(func() {
+			u.enrichObservationWindows(ctx, snapshot.Data.Items[i].Credential.Observation, prepared[i].allIDs, now)
+		})
+	}
+	enrichGroup.Wait()
+
+	return snapshot, nil
+}
+
+func (u upstream) fetchGroupCredentialsAllPages(ctx context.Context, groupID int64) ([]upstreamCredential, int64, error) {
+	var all []upstreamCredential
+	var observedAtMS int64
+	for page := 1; page <= maxCredentialPages; page++ {
+		path := fmt.Sprintf("/api/modern/groups/%d/credentials?page=%d&page_size=%d", groupID, page, credentialPageSize)
+		resp, err := fetchUpstream[upstreamGroupCredentials](ctx, u, path)
+		if err != nil {
+			return nil, 0, err
+		}
+		observedAtMS = max(observedAtMS, resp.ObservedAt)
+		all = append(all, resp.Items...)
+		if len(resp.Items) == 0 || page >= resp.Pagination.TotalPages {
+			break
+		}
+	}
+	return all, observedAtMS, nil
+}
+
+func subscriptionAccountKey(channelKey string, cred upstreamCredential) accountKey {
+	email := strings.ToLower(strings.TrimSpace(cred.Account.Email))
+	if email == "" && cred.Observation != nil && cred.Observation.Snapshot != nil && cred.Observation.Snapshot.Account != nil {
+		email = strings.ToLower(strings.TrimSpace(cred.Observation.Snapshot.Account.Email))
+	}
+	if email != "" {
+		return accountKey{channel: channelKey, email: email}
+	}
+	return accountKey{channel: channelKey, credentialID: cred.ID}
+}
+
+func isCredentialActive(configuredStatus, effectiveStatus string) bool {
+	configured := strings.ToLower(strings.TrimSpace(configuredStatus))
+	if configured == "disabled" {
+		return false
+	}
+	if configured == "" && strings.ToLower(strings.TrimSpace(effectiveStatus)) == "disabled" {
+		return false
+	}
+	return true
+}
+
+func resolveCredentialWeight(weight, weightManual *int) *int {
+	if weightManual != nil {
+		value := *weightManual
+		return &value
+	}
+	if weight != nil {
+		value := *weight
+		return &value
+	}
+	return nil
+}
+
+func isCredentialAvailable(effectiveStatus string) bool {
+	return strings.EqualFold(strings.TrimSpace(effectiveStatus), "available")
+}
+
+func observationObservedAt(obs *upstreamObservation) int64 {
+	if obs == nil {
+		return 0
+	}
+	return obs.ObservedAt
+}
+
+func buildPreparedSubscriptionAccount(acc *aggregatedSubscriptionAccount) preparedSubscriptionAccount {
+	rep := acc.activeMembers[0]
+	groups := make(map[int64]bool, len(acc.activeMembers))
+	availableGroups := make(map[int64]bool, len(acc.activeMembers))
+	links := make([]subscriptionCredentialLink, 0, len(acc.activeMembers))
+
+	var minW, maxW int
+	hasWeight := false
+	for _, m := range acc.activeMembers {
+		groups[m.groupID] = true
+		if isCredentialAvailable(m.cred.EffectiveStatus) {
+			availableGroups[m.groupID] = true
+		}
+		if m.currentWeight != nil {
+			w := *m.currentWeight
+			if !hasWeight {
+				minW, maxW, hasWeight = w, w, true
+			} else {
+				minW = min(minW, w)
+				maxW = max(maxW, w)
+			}
+		}
+		links = append(links, subscriptionCredentialLink{
+			GroupID:       m.groupID,
+			CredentialID:  m.cred.ID,
+			CurrentWeight: m.currentWeight,
+		})
+		if betterRepresentative(m, rep) {
+			rep = m
+		}
+	}
+
+	displayName := maskSubscriptionName(rep.cred.Name)
+	if displayName == "" {
+		displayName = strings.TrimSpace(rep.cred.Account.EmailMask)
+	}
+	var weightPtr, weightMinPtr, weightMaxPtr *int
+	if hasWeight {
+		repW := minW
+		if rep.currentWeight != nil {
+			repW = *rep.currentWeight
+		}
+		weightPtr = &repW
+		if minW != maxW {
+			weightMinPtr = &minW
+			weightMaxPtr = &maxW
+		}
+	}
+
+	return preparedSubscriptionAccount{
+		item: subscription{
+			ChannelName:         acc.channelName,
+			GroupCount:          len(groups),
+			AvailableGroupCount: len(availableGroups),
+			Credential: subscriptionCredential{
+				ID:              rep.cred.ID,
+				DisplayName:     displayName,
+				EffectiveStatus: rep.cred.EffectiveStatus,
+				Weight:          weightPtr,
+				WeightMin:       weightMinPtr,
+				WeightMax:       weightMaxPtr,
+				Observation:     sanitizeObservation(rep.cred.Observation),
+			},
+		},
+		allIDs: acc.allIDs,
+		links:  links,
+	}
+}
+
+func betterRepresentative(candidate, current activeCredentialMember) bool {
+	cObs := observationObservedAt(candidate.cred.Observation)
+	curObs := observationObservedAt(current.cred.Observation)
+	if cObs != curObs {
+		return cObs > curObs
+	}
+	cAvail := isCredentialAvailable(candidate.cred.EffectiveStatus)
+	curAvail := isCredentialAvailable(current.cred.EffectiveStatus)
+	if cAvail != curAvail {
+		return cAvail
+	}
+	return candidate.cred.ID < current.cred.ID
+}
+
+func sanitizeObservation(src *upstreamObservation) *observation {
+	if src == nil {
 		return nil
 	}
-	return ids
+	dst := &observation{
+		State:      src.State,
+		ObservedAt: src.ObservedAt,
+	}
+	if src.Snapshot != nil {
+		snap := &struct {
+			Plan *struct {
+				Name string `json:"name"`
+			} `json:"plan_summary,omitempty"`
+			Windows []quotaWindow `json:"quota_windows"`
+		}{}
+		if src.Snapshot.Plan != nil {
+			snap.Plan = &struct {
+				Name string `json:"name"`
+			}{Name: src.Snapshot.Plan.Name}
+		}
+		if len(src.Snapshot.Windows) > 0 {
+			snap.Windows = make([]quotaWindow, len(src.Snapshot.Windows))
+			copy(snap.Windows, src.Snapshot.Windows)
+		}
+		dst.Snapshot = snap
+	}
+	return dst
+}
+
+func (u upstream) enrichObservationWindows(ctx context.Context, obs *observation, ids []int64, now time.Time) {
+	if obs == nil || obs.Snapshot == nil || len(obs.Snapshot.Windows) == 0 {
+		return
+	}
+	for i := range obs.Snapshot.Windows {
+		window := &obs.Snapshot.Windows[i]
+		if window.ResetAt == nil || *window.ResetAt <= 0 || window.Seconds <= 0 || window.Seconds > 31*24*60*60 {
+			continue
+		}
+		reset := time.UnixMilli(*window.ResetAt)
+		start := reset.Add(-time.Duration(window.Seconds) * time.Second)
+		safeLevel := quotaSafeLevel(start, reset, now, window.Seconds == weekSeconds)
+		window.SafeLevel = &safeLevel
+		span := usageSpan{start.UnixMilli(), min(*window.ResetAt, obs.ObservedAt)}
+		if window.isAccountPercent() && span.to > span.from {
+			u.loadQuotaAmounts(ctx, window, ids, span)
+		}
+	}
 }
 
 func (u upstream) loadQuotaAmounts(ctx context.Context, window *quotaWindow, ids []int64, span usageSpan) {
 	if len(ids) == 0 {
 		window.Incomplete = true
+		window.usageFetchFailed = true
 		return
 	}
 	results := make([]*usageSummary, len(ids))
@@ -118,6 +458,7 @@ func (u upstream) loadQuotaAmounts(ctx context.Context, window *quotaWindow, ids
 	for _, result := range results {
 		if result == nil {
 			window.Incomplete = true
+			window.usageFetchFailed = true
 			continue
 		}
 		window.Incomplete = window.Incomplete || result.incomplete()
@@ -125,6 +466,7 @@ func (u upstream) loadQuotaAmounts(ctx context.Context, window *quotaWindow, ids
 		cost, err := strconv.ParseInt(result.Cost, 10, 64)
 		if err != nil || cost < 0 {
 			window.Incomplete = true
+			window.usageFetchFailed = true
 			continue
 		}
 		hasPrice = hasPrice || cost > 0 || (result.Requests > 0 && !result.incomplete())

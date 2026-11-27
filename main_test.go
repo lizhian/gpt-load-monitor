@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -31,11 +32,21 @@ func TestDashboardAccessAndPartialFailure(t *testing.T) {
 			data = `{"concurrency":{"current":3,"limit":16},"access_keys":[{"masked_key":"private-detail"}]}`
 		case "/api/access-keys/options":
 			data = `[]`
-		case "/api/home/subscription-accounts":
-			data = `{"items":[
-				{"credential_key":"private-detail","credential":{"credential_id":5,"name":" 中文测试号 ","account":{"email_mask":"a***z@example.net"}}},
-				{"credential":{"credential_id":6,"name":" ","account":{"email":"private-user@example.com","email_mask":"p***r@example.com"}}},
-				{"credential":{"credential_id":7,"account":{"email":"private-detail"}}}
+		case "/api/modern/groups":
+			data = `{"observed_at_ms":1763880840000,"items":[
+				{"id":1,"name":"Codex","channel_id":"codex","channel_name":"Codex","connection_type":"subscription","enabled":true},
+				{"id":2,"name":"Codex Paused","channel_id":"codex","channel_name":"Codex","connection_type":"subscription","enabled":false}
+			]}`
+		case "/api/modern/groups/1/credentials":
+			data = `{"observed_at_ms":1763880840000,"pagination":{"page":1,"page_size":100,"total_items":4,"total_pages":1},"items":[
+				{"credential_id":5,"name":" 中文测试号 ","configured_status":"active","effective_status":"available","weight":80,"account":{"email":"a@example.net","email_mask":"a***z@example.net"}},
+				{"credential_id":6,"name":" ","configured_status":"active","effective_status":"available","weight":50,"account":{"email":"private-user@example.com","email_mask":"p***r@example.com"}},
+				{"credential_id":7,"configured_status":"active","effective_status":"available","weight":25,"account":{"email":"private-detail"}},
+				{"credential_id":8,"name":"停用账号","configured_status":"disabled","effective_status":"disabled","weight":10,"account":{"email":"disabled@example.com","email_mask":"d***d@example.com"}}
+			]}`
+		case "/api/modern/groups/2/credentials":
+			data = `{"observed_at_ms":1763880840000,"pagination":{"page":1,"page_size":100,"total_items":1,"total_pages":1},"items":[
+				{"credential_id":9,"name":"停用分组账号","configured_status":"active","effective_status":"disabled","weight":5,"account":{"email":"disabled-group@example.com","email_mask":"g***p@example.com"}}
 			]}`
 		case "/api/usage":
 			from, _ := strconv.ParseInt(r.URL.Query().Get("from_ms"), 10, 64)
@@ -92,6 +103,9 @@ func TestDashboardAccessAndPartialFailure(t *testing.T) {
 	if w := request(http.MethodGet, "/api/dashboard?range=day", "", cookie); w.Code != http.StatusBadRequest {
 		t.Fatalf("invalid range: status %d", w.Code)
 	}
+	if w := request(http.MethodPut, "/api/groups/1/credentials/5", "", cookie); w.Code != http.StatusNotFound && w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("dashboard must remain read-only, got status %d", w.Code)
+	}
 	for _, tc := range []struct {
 		period, want string
 		hours        int
@@ -111,9 +125,9 @@ func TestDashboardAccessAndPartialFailure(t *testing.T) {
 				t.Errorf("range %s response missing %q", tc.period, want)
 			}
 		}
-		for _, private := range []string{"private-detail", upstreamKey, "中文测试号", "private-user@example.com", "a***z@example.net"} {
+		for _, private := range []string{"private-detail", upstreamKey, "中文测试号", "private-user@example.com", "a***z@example.net", "a@example.net", "disabled@example.com", "disabled-group@example.com", "停用账号", "停用分组账号"} {
 			if strings.Contains(body, private) {
-				t.Errorf("range %s exposed data outside the dashboard projection", tc.period)
+				t.Errorf("range %s exposed data outside the dashboard projection (%q)", tc.period, private)
 			}
 		}
 		if tc.period == "" {
@@ -128,12 +142,32 @@ func TestDashboardAccessAndPartialFailure(t *testing.T) {
 				t.Fatal(err)
 			}
 			if result.Quota.Data == nil || len(result.Quota.Data.Items) != 3 {
-				t.Fatal("dashboard should contain three quota items")
+				t.Fatalf("dashboard should contain three active quota items, got %v", result.Quota.Data)
 			}
-			for i, want := range []string{"中***号", "p***r@example.com", ""} {
-				if credential := result.Quota.Data.Items[i].Credential; credential.DisplayName != want {
-					t.Errorf("credential %d: display name does not match the masked value", credential.ID)
+			wantByID := map[int64]struct {
+				name   string
+				weight int
+			}{
+				5: {name: "中***号", weight: 80},
+				6: {name: "p***r@example.com", weight: 50},
+				7: {name: "", weight: 25},
+			}
+			for _, item := range result.Quota.Data.Items {
+				credential := item.Credential
+				want, ok := wantByID[credential.ID]
+				if !ok {
+					t.Fatalf("unexpected credential %d in dashboard quota", credential.ID)
 				}
+				if credential.DisplayName != want.name {
+					t.Errorf("credential %d: display name %q != %q", credential.ID, credential.DisplayName, want.name)
+				}
+				if credential.Weight == nil || *credential.Weight != want.weight {
+					t.Errorf("credential %d: weight = %v, want %d", credential.ID, credential.Weight, want.weight)
+				}
+				delete(wantByID, credential.ID)
+			}
+			if len(wantByID) != 0 {
+				t.Errorf("missing credentials in dashboard quota: %+v", wantByID)
 			}
 		}
 		if tc.hours > 0 {
@@ -169,12 +203,15 @@ func TestDashboardQuotaAndAccessKeyWindow(t *testing.T) {
 			data = `{"concurrency":{"current":3}}`
 		case "/api/access-keys/options":
 			data = `[{"id":3,"name":"Idle","status":"disabled"},{"id":2,"name":"Active"}]`
-		case "/api/home/subscription-accounts":
-			data = fmt.Sprintf(`{"observed_at_ms":%d,"items":[{"group_count":2,"credential_key":"test-identity","credential":{"credential_id":5,"observation":{"observed_at_ms":%d,"snapshot":{"quota_windows":[{"unit":"percent","utilization":0.05,"window_seconds":604800,"reset_at_ms":%d}]}}}}]}`, now.UnixMilli(), now.UnixMilli(), reset.UnixMilli())
+		case "/api/modern/groups":
+			data = `{"observed_at_ms":` + strconv.FormatInt(now.UnixMilli(), 10) + `,"items":[
+				{"id":1,"name":"Codex 1","channel_id":"codex","channel_name":"Codex","connection_type":"subscription","enabled":true},
+				{"id":2,"name":"Codex 2","channel_id":"codex","channel_name":"Codex","connection_type":"subscription","enabled":true}
+			]}`
 		case "/api/modern/groups/1/credentials":
-			data = `{"items":[{"credential_id":5},{"credential_id":5}]}`
+			data = fmt.Sprintf(`{"observed_at_ms":%d,"pagination":{"page":1,"page_size":100,"total_items":1,"total_pages":1},"items":[{"credential_id":5,"configured_status":"active","effective_status":"available","weight":40,"account":{"email":"shared@example.com"},"observation":{"observed_at_ms":%d,"snapshot":{"quota_windows":[{"unit":"percent","utilization":0.05,"window_seconds":604800,"reset_at_ms":%d}]}}}]}`, now.UnixMilli(), now.UnixMilli(), reset.UnixMilli())
 		case "/api/modern/groups/2/credentials":
-			data = `{"items":[{"credential_id":6}]}`
+			data = fmt.Sprintf(`{"observed_at_ms":%d,"pagination":{"page":1,"page_size":100,"total_items":1,"total_pages":1},"items":[{"credential_id":6,"configured_status":"active","effective_status":"available","weight":80,"account":{"email":"shared@example.com"},"observation":{"observed_at_ms":%d,"snapshot":{"quota_windows":[{"unit":"percent","utilization":0.05,"window_seconds":604800,"reset_at_ms":%d}]}}}]}`, now.UnixMilli(), now.UnixMilli()-1000, reset.UnixMilli())
 		case "/api/usage":
 			q := r.URL.Query()
 			wantFrom, wantTo := yesterday, today
@@ -259,6 +296,12 @@ func TestDashboardQuotaAndAccessKeyWindow(t *testing.T) {
 	if response.Quota.Data == nil || !response.Quota.Data.Items[0].Credential.Observation.Snapshot.Windows[0].Incomplete {
 		t.Error("partially priced quota should be marked incomplete")
 	}
+	qItem := response.Quota.Data.Items[0]
+	if qItem.GroupCount != 2 || qItem.AvailableGroupCount != 2 ||
+		qItem.Credential.WeightMin == nil || *qItem.Credential.WeightMin != 40 ||
+		qItem.Credential.WeightMax == nil || *qItem.Credential.WeightMax != 80 {
+		t.Errorf("unexpected cross-group quota weight summary: item=%+v cred=%+v", qItem, qItem.Credential)
+	}
 	items := response.AccessKeys.Data.Items
 	if len(items) != 3 || items[0]["name"] != "Active" || items[1]["id"] != float64(4) || items[1]["deleted"] != true || items[2]["name"] != "Idle" {
 		t.Fatalf("unexpected AccessKey rows: %v", items)
@@ -314,5 +357,123 @@ func TestDashboardQuotaAndAccessKeyWindow(t *testing.T) {
 	}
 	if _, exists := items[2]["series"]; exists {
 		t.Error("idle AccessKey should have no series")
+	}
+}
+
+func TestDashboardWeightAdjustStatusAndAllAccounts(t *testing.T) {
+	now := time.Date(2026, 11, 23, 6, 54, 0, 0, time.UTC)
+	start := now.Add(-5*time.Hour - 54*time.Minute)
+	reset := start.Add(7 * 24 * time.Hour)
+
+	var failPut atomic.Bool
+	failPut.Store(true)
+	var weights [6]atomic.Int64
+	for i := 1; i <= 5; i++ {
+		weights[i].Store(50)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/health":
+			fmt.Fprint(w, `{"code":0,"data":{"version":"v2","groups":[{"id":1,"name":"Codex","enabled":true}]}}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/home":
+			fmt.Fprint(w, `{"code":0,"data":{"concurrency":{"current":1,"limit":10}}}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/access-keys/options":
+			fmt.Fprint(w, `{"code":0,"data":[]}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/modern/groups":
+			fmt.Fprintf(w, `{"code":0,"data":{"observed_at_ms":%d,"items":[{"id":1,"name":"Codex","channel_id":"codex","channel_name":"Codex","connection_type":"subscription","enabled":true}]}}`, now.UnixMilli())
+		case r.Method == http.MethodGet && r.URL.Path == "/api/modern/groups/1/credentials":
+			var items []string
+			for i := 1; i <= 5; i++ {
+				items = append(items, fmt.Sprintf(
+					`{"credential_id":%d,"name":"账号%d","configured_status":"active","effective_status":"available","weight":%d,"account":{"email":"user%d@example.com","email_mask":"u***%d@example.com"},"observation":{"state":"fresh","observed_at_ms":%d,"snapshot":{"quota_windows":[{"id":"7d","unit":"percent","scope":"account","utilization":0.05,"window_seconds":604800,"reset_at_ms":%d}]}}}`,
+					i, i, weights[i].Load(), i, i, now.UnixMilli(), reset.UnixMilli(),
+				))
+			}
+			fmt.Fprintf(w, `{"code":0,"data":{"observed_at_ms":%d,"pagination":{"page":1,"page_size":100,"total_items":5,"total_pages":1},"items":[%s]}}`, now.UnixMilli(), strings.Join(items, ","))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/usage":
+			cred := r.URL.Query().Get("credential_id")
+			cost := "0"
+			if cred != "" {
+				id, _ := strconv.Atoi(cred)
+				cost = strconv.FormatInt(int64(id)*10000000000, 10)
+			}
+			fmt.Fprintf(w, `{"code":0,"data":{"summary":{"request_count":1,"estimated_cost_nano_usd":%q}}}`, cost)
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/api/groups/1/credentials/"):
+			idStr := strings.TrimPrefix(r.URL.Path, "/api/groups/1/credentials/")
+			id, _ := strconv.Atoi(idStr)
+			if id == 1 && failPut.Load() {
+				http.Error(w, "raw-secret user1@example.com", http.StatusBadGateway)
+				return
+			}
+			var body struct {
+				WeightManual int64 `json:"weight_manual"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			weights[id].Store(body.WeightManual)
+			fmt.Fprintf(w, `{"code":0,"data":{"credential_id":%d}}`, id)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	a := newApp(config{
+		baseURL:            upstream.URL,
+		upstreamKey:        "raw-secret",
+		password:           "viewer",
+		sessionKey:         strings.Repeat("k", 32),
+		autoWeightEnabled:  true,
+		autoWeightInterval: 30 * time.Minute,
+	}, func() time.Time { return now })
+	handler := a.handler()
+
+	_ = a.adjuster.RunOnce(context.Background())
+
+	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("password=viewer"))
+	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	lw := httptest.NewRecorder()
+	handler.ServeHTTP(lw, login)
+	cookie := lw.Result().Cookies()[0]
+
+	req := httptest.NewRequest(http.MethodGet, "/api/dashboard?range=24h", nil)
+	req.AddCookie(cookie)
+	rw := httptest.NewRecorder()
+	handler.ServeHTTP(rw, req)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("dashboard status %d", rw.Code)
+	}
+	body := rw.Body.String()
+	for _, secret := range []string{"raw-secret", "user1@example.com", "账号1"} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("dashboard leaked %q", secret)
+		}
+	}
+
+	var resp dashboardResponse
+	if err := json.Unmarshal(rw.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Quota.Data == nil || len(resp.Quota.Data.Items) != 5 {
+		t.Fatalf("expected all 5 active subscription accounts (beyond home top-4), got %+v", resp.Quota.Data)
+	}
+	if resp.WeightAdjust == nil || !resp.WeightAdjust.Enabled || resp.WeightAdjust.LastRunAt != now.UnixMilli() || resp.WeightAdjust.Error == "" {
+		t.Fatalf("unexpected weight_adjust status after partial failure: %+v", resp.WeightAdjust)
+	}
+
+	failPut.Store(false)
+	if err := a.adjuster.RunOnce(context.Background()); err != nil {
+		t.Fatalf("second RunOnce failed: %v", err)
+	}
+	req2 := httptest.NewRequest(http.MethodGet, "/api/dashboard?range=24h", nil)
+	req2.AddCookie(cookie)
+	rw2 := httptest.NewRecorder()
+	handler.ServeHTTP(rw2, req2)
+	var resp2 dashboardResponse
+	if err := json.Unmarshal(rw2.Body.Bytes(), &resp2); err != nil {
+		t.Fatal(err)
+	}
+	if resp2.WeightAdjust == nil || resp2.WeightAdjust.Error != "" {
+		t.Fatalf("expected cleared weight_adjust error after recovery, got %+v", resp2.WeightAdjust)
 	}
 }

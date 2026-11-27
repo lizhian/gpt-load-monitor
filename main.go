@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"embed"
@@ -16,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,24 +27,31 @@ import (
 //go:embed web/*.html web/assets/*
 var web embed.FS
 
-const sessionDuration = 7 * 24 * time.Hour
+const (
+	sessionDuration           = 7 * 24 * time.Hour
+	defaultAutoWeightInterval = 30 * time.Minute
+)
 
 type config struct {
-	addr         string
-	baseURL      string
-	upstreamKey  string
-	password     string
-	sessionKey   string
-	secureCookie bool
+	addr               string
+	baseURL            string
+	upstreamKey        string
+	password           string
+	sessionKey         string
+	secureCookie       bool
+	autoWeightEnabled  bool
+	autoWeightInterval time.Duration
 }
 
 func loadConfig() (config, error) {
 	cfg := config{
-		addr:        os.Getenv("ADDR"),
-		baseURL:     os.Getenv("GPT_LOAD_BASE_URL"),
-		upstreamKey: strings.TrimSpace(os.Getenv("GPT_LOAD_AUTH_KEY")),
-		password:    os.Getenv("VIEWER_PASSWORD"),
-		sessionKey:  os.Getenv("SESSION_SECRET"),
+		addr:               os.Getenv("ADDR"),
+		baseURL:            os.Getenv("GPT_LOAD_BASE_URL"),
+		upstreamKey:        strings.TrimSpace(os.Getenv("GPT_LOAD_AUTH_KEY")),
+		password:           os.Getenv("VIEWER_PASSWORD"),
+		sessionKey:         os.Getenv("SESSION_SECRET"),
+		autoWeightEnabled:  true,
+		autoWeightInterval: defaultAutoWeightInterval,
 	}
 	if cfg.addr == "" {
 		cfg.addr = "127.0.0.1:8080"
@@ -64,6 +73,18 @@ func loadConfig() (config, error) {
 			return cfg, errors.New("COOKIE_SECURE must be true or false")
 		}
 	}
+	if value := os.Getenv("AUTO_WEIGHT_ENABLED"); value != "" {
+		cfg.autoWeightEnabled, err = strconv.ParseBool(value)
+		if err != nil {
+			return cfg, errors.New("AUTO_WEIGHT_ENABLED must be true or false")
+		}
+	}
+	if value := os.Getenv("AUTO_WEIGHT_INTERVAL"); value != "" {
+		cfg.autoWeightInterval, err = time.ParseDuration(value)
+		if err != nil || cfg.autoWeightInterval <= 0 {
+			return cfg, errors.New("AUTO_WEIGHT_INTERVAL must be a positive duration")
+		}
+	}
 	return cfg, nil
 }
 
@@ -72,9 +93,15 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	application := newApp(cfg, time.Now)
+	if cfg.autoWeightEnabled {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		defer stop()
+		go application.adjuster.Start(ctx)
+	}
 	server := &http.Server{
 		Addr:              cfg.addr,
-		Handler:           newHandler(cfg, time.Now),
+		Handler:           application.handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      15 * time.Second,
@@ -86,6 +113,7 @@ func main() {
 
 type app struct {
 	upstream     upstream
+	adjuster     *weightAdjuster
 	now          func() time.Time
 	loginPage    *template.Template
 	indexPage    []byte
@@ -96,39 +124,48 @@ type app struct {
 }
 
 func newHandler(cfg config, now func() time.Time) http.Handler {
-	assets, err := fs.Sub(web, "web/assets")
-	if err != nil {
-		panic(err)
-	}
+	return newApp(cfg, now).handler()
+}
+
+func newApp(cfg config, now func() time.Time) *app {
 	var indexPage bytes.Buffer
 	indexTemplate := template.Must(template.ParseFS(web, "web/index.html"))
 	if err := indexTemplate.ExecuteTemplate(&indexPage, "index.html", struct{ MainSiteURL string }{cfg.baseURL}); err != nil {
 		panic(err)
 	}
-	app := &app{
-		now: now,
-		upstream: upstream{
-			baseURL: cfg.baseURL,
-			key:     cfg.upstreamKey,
-			slots:   make(chan struct{}, 8),
-			client: &http.Client{
-				Timeout: 8 * time.Second,
-				CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-					return http.ErrUseLastResponse
-				},
+	up := upstream{
+		baseURL: cfg.baseURL,
+		key:     cfg.upstreamKey,
+		slots:   make(chan struct{}, 8),
+		client: &http.Client{
+			Timeout: 8 * time.Second,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
 			},
 		},
+	}
+	return &app{
+		now:          now,
+		upstream:     up,
+		adjuster:     newWeightAdjuster(up, cfg.autoWeightEnabled, cfg.autoWeightInterval, now),
 		loginPage:    template.Must(template.ParseFS(web, "web/login.html")),
 		indexPage:    indexPage.Bytes(),
 		password:     sha256.Sum256([]byte(cfg.password)),
 		sessionKey:   []byte(cfg.sessionKey),
 		secureCookie: cfg.secureCookie,
 	}
+}
+
+func (a *app) handler() http.Handler {
+	assets, err := fs.Sub(web, "web/assets")
+	if err != nil {
+		panic(err)
+	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", app.index)
-	mux.HandleFunc("POST /login", app.login)
-	mux.HandleFunc("POST /logout", app.logout)
-	mux.HandleFunc("GET /api/dashboard", app.dashboard)
+	mux.HandleFunc("GET /{$}", a.index)
+	mux.HandleFunc("POST /login", a.login)
+	mux.HandleFunc("POST /logout", a.logout)
+	mux.HandleFunc("GET /api/dashboard", a.dashboard)
 	mux.Handle("GET /assets/", http.StripPrefix("/assets/", http.FileServerFS(assets)))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)

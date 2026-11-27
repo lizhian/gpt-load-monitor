@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -27,11 +28,12 @@ type section[T any] struct {
 }
 
 type dashboardResponse struct {
-	Health      section[healthData]      `json:"health"`
-	Concurrency section[concurrencyData] `json:"concurrency"`
-	Quota       section[quotaData]       `json:"quota"`
-	Usage       section[usageData]       `json:"usage"`
-	AccessKeys  section[accessKeyData]   `json:"access_keys"`
+	Health       section[healthData]      `json:"health"`
+	Concurrency  section[concurrencyData] `json:"concurrency"`
+	Quota        section[quotaData]       `json:"quota"`
+	Usage        section[usageData]       `json:"usage"`
+	AccessKeys   section[accessKeyData]   `json:"access_keys"`
+	WeightAdjust *weightAdjustStatus      `json:"weight_adjust,omitempty"`
 }
 
 func (a *app) dashboard(w http.ResponseWriter, r *http.Request) {
@@ -68,11 +70,15 @@ func (a *app) dashboard(w http.ResponseWriter, r *http.Request) {
 		})
 	})
 	group.Go(func() {
-		response.Quota = loadSection(ctx, a.upstream, "/api/home/subscription-accounts", "订阅额度暂时无法更新。", identity[quotaData])
-		if response.Quota.Data != nil {
-			<-healthReady
-			a.upstream.enrichQuota(ctx, response.Quota.Data, response.Health.Data, now)
+		snap, err := a.upstream.loadSubscriptionSnapshot(ctx, now)
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Printf("GPT-Load subscription snapshot: %v", err)
+			}
+			response.Quota = section[quotaData]{Error: "订阅额度暂时无法更新。"}
+			return
 		}
+		response.Quota = section[quotaData]{Data: &snap.Data, UpdatedAt: time.Now().UnixMilli()}
 	})
 	group.Go(func() {
 		data, err := a.upstream.readUsage(ctx, span, nil)
@@ -103,6 +109,10 @@ func (a *app) dashboard(w http.ResponseWriter, r *http.Request) {
 		response.AccessKeys = a.upstream.accessKeyUsage(ctx, span, keys)
 	})
 	group.Wait()
+	if a.adjuster != nil {
+		status := a.adjuster.Status()
+		response.WeightAdjust = &status
+	}
 	writeJSON(w, http.StatusOK, response)
 }
 
@@ -121,6 +131,18 @@ func loadSection[In, Out any](ctx context.Context, upstream upstream, path, mess
 }
 
 func fetchUpstream[T any](ctx context.Context, upstream upstream, path string) (T, error) {
+	return doUpstream[T](ctx, upstream, http.MethodGet, path, nil)
+}
+
+func (u upstream) updateCredentialWeight(ctx context.Context, groupID, credentialID int64, weight int) error {
+	path := fmt.Sprintf("/api/groups/%d/credentials/%d", groupID, credentialID)
+	_, err := doUpstream[json.RawMessage](ctx, u, http.MethodPut, path, struct {
+		WeightManual int `json:"weight_manual"`
+	}{WeightManual: weight})
+	return err
+}
+
+func doUpstream[T any](ctx context.Context, upstream upstream, method, path string, payload any) (T, error) {
 	var zero T
 	select {
 	case upstream.slots <- struct{}{}:
@@ -128,12 +150,23 @@ func fetchUpstream[T any](ctx context.Context, upstream upstream, path string) (
 	case <-ctx.Done():
 		return zero, ctx.Err()
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, upstream.baseURL+path, nil)
+	var body io.Reader
+	if payload != nil {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return zero, err
+		}
+		body = bytes.NewReader(encoded)
+	}
+	request, err := http.NewRequestWithContext(ctx, method, upstream.baseURL+path, body)
 	if err != nil {
 		return zero, err
 	}
 	request.Header.Set("Authorization", "Bearer "+upstream.key)
 	request.Header.Set("Accept", "application/json")
+	if payload != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
 	response, err := upstream.client.Do(request)
 	if err != nil {
 		return zero, err
@@ -149,10 +182,19 @@ func fetchUpstream[T any](ctx context.Context, upstream upstream, path string) (
 	if err := json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(&envelope); err != nil {
 		return zero, errors.New("invalid management API response")
 	}
-	if envelope.Code == nil || *envelope.Code != 0 || envelope.Data == nil {
-		return zero, errors.New("management API did not return data")
+	if envelope.Code == nil || *envelope.Code != 0 {
+		return zero, errors.New("management API did not return success")
 	}
-	return *envelope.Data, nil
+	if method == http.MethodGet {
+		if envelope.Data == nil {
+			return zero, errors.New("management API did not return data")
+		}
+		return *envelope.Data, nil
+	}
+	if envelope.Data != nil {
+		return *envelope.Data, nil
+	}
+	return zero, nil
 }
 
 // These response types select the dashboard's fields from upstream JSON.
@@ -196,10 +238,9 @@ type quotaData struct {
 }
 
 type subscription struct {
-	ChannelName         string `json:"channel_name"`
-	GroupCount          int    `json:"group_count"`
-	AvailableGroupCount int    `json:"available_group_count"`
-	credentialKey       string
+	ChannelName         string                 `json:"channel_name"`
+	GroupCount          int                    `json:"group_count"`
+	AvailableGroupCount int                    `json:"available_group_count"`
 	Credential          subscriptionCredential `json:"credential"`
 }
 
@@ -207,32 +248,10 @@ type subscriptionCredential struct {
 	ID              int64        `json:"credential_id"`
 	DisplayName     string       `json:"display_name,omitempty"`
 	EffectiveStatus string       `json:"effective_status"`
+	Weight          *int         `json:"weight,omitempty"`
+	WeightMin       *int         `json:"weight_min,omitempty"`
+	WeightMax       *int         `json:"weight_max,omitempty"`
 	Observation     *observation `json:"observation,omitempty"`
-}
-
-func (s *subscription) UnmarshalJSON(data []byte) error {
-	type wireSubscription subscription
-	wire := struct {
-		*wireSubscription
-		CredentialKey string `json:"credential_key"`
-		Credential    struct {
-			subscriptionCredential
-			Name    string `json:"name"`
-			Account struct {
-				EmailMask string `json:"email_mask"`
-			} `json:"account"`
-		} `json:"credential"`
-	}{wireSubscription: (*wireSubscription)(s)}
-	if err := json.Unmarshal(data, &wire); err != nil {
-		return err
-	}
-	s.credentialKey = wire.CredentialKey
-	s.Credential = wire.Credential.subscriptionCredential
-	s.Credential.DisplayName = maskSubscriptionName(wire.Credential.Name)
-	if s.Credential.DisplayName == "" {
-		s.Credential.DisplayName = strings.TrimSpace(wire.Credential.Account.EmailMask)
-	}
-	return nil
 }
 
 func maskSubscriptionName(name string) string {
@@ -261,23 +280,77 @@ type observation struct {
 }
 
 type quotaWindow struct {
-	ID          string   `json:"id"`
-	Label       string   `json:"label"`
-	Scope       string   `json:"scope"`
-	Unit        string   `json:"unit"`
-	Used        *float64 `json:"used,omitempty"`
-	Limit       *float64 `json:"limit,omitempty"`
-	Remaining   *float64 `json:"remaining,omitempty"`
-	Utilization *float64 `json:"utilization,omitempty"`
-	ResetAt     *int64   `json:"reset_at_ms,omitempty"`
-	Seconds     int64    `json:"window_seconds"`
-	State       string   `json:"state"`
-	SafeLevel   *float64 `json:"safe_level_percent,omitempty"`
-	UsedUSD     *float64 `json:"used_amount_usd,omitempty"`
-	EstimateUSD *float64 `json:"estimated_limit_usd,omitempty"`
-	SafeUSD     *float64 `json:"safe_amount_usd,omitempty"`
-	AheadUSD    *float64 `json:"ahead_amount_usd,omitempty"`
-	Incomplete  bool     `json:"pricing_incomplete,omitempty"`
+	ID               string   `json:"id"`
+	Label            string   `json:"label"`
+	Scope            string   `json:"scope"`
+	Unit             string   `json:"unit"`
+	Used             *float64 `json:"used,omitempty"`
+	Limit            *float64 `json:"limit,omitempty"`
+	Remaining        *float64 `json:"remaining,omitempty"`
+	Utilization      *float64 `json:"utilization,omitempty"`
+	ResetAt          *int64   `json:"reset_at_ms,omitempty"`
+	Seconds          int64    `json:"window_seconds"`
+	State            string   `json:"state"`
+	SafeLevel        *float64 `json:"safe_level_percent,omitempty"`
+	UsedUSD          *float64 `json:"used_amount_usd,omitempty"`
+	EstimateUSD      *float64 `json:"estimated_limit_usd,omitempty"`
+	SafeUSD          *float64 `json:"safe_amount_usd,omitempty"`
+	AheadUSD         *float64 `json:"ahead_amount_usd,omitempty"`
+	Incomplete       bool     `json:"pricing_incomplete,omitempty"`
+	usageFetchFailed bool
+}
+
+func (w quotaWindow) isAccountPercent() bool {
+	return w.Unit == "percent" && (w.Scope == "" || w.Scope == "account")
+}
+
+func (w quotaWindow) isWeeklyAccountPercent() bool {
+	return w.isAccountPercent() && w.Seconds == weekSeconds
+}
+
+func (w quotaWindow) remainingSafeQuota() (float64, bool) {
+	if w.usageFetchFailed {
+		return 0, false
+	}
+	if w.AheadUSD != nil {
+		return 0, true
+	}
+	if w.SafeUSD != nil {
+		if *w.SafeUSD <= 0 {
+			return 0, true
+		}
+		return *w.SafeUSD, true
+	}
+	return 0, false
+}
+
+func (o *observation) remainingSafeQuota() (float64, bool) {
+	if o == nil || o.Snapshot == nil || len(o.Snapshot.Windows) == 0 {
+		return 0, false
+	}
+	hasWeekly := false
+	for _, w := range o.Snapshot.Windows {
+		if w.isWeeklyAccountPercent() {
+			hasWeekly = true
+			break
+		}
+	}
+	var minSafe float64
+	found := false
+	for _, w := range o.Snapshot.Windows {
+		if hasWeekly && !w.isWeeklyAccountPercent() {
+			continue
+		}
+		safe, ok := w.remainingSafeQuota()
+		if !ok {
+			continue
+		}
+		if !found || safe < minSafe {
+			minSafe = safe
+			found = true
+		}
+	}
+	return minSafe, found
 }
 
 type usageData struct {

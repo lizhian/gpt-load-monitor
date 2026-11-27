@@ -52,6 +52,7 @@
       concurrency: { data: null, updatedAtMs: null, error: null },
       quota: { data: null, updatedAtMs: null, error: null },
     },
+    weightAdjust: null,
     usageByRange: createRangeCache(),
     accessKeysByRange: createRangeCache(),
     chart: {
@@ -590,6 +591,7 @@
       state.sections.health.error ||
       state.sections.concurrency.error ||
       state.sections.quota.error ||
+      (state.weightAdjust && state.weightAdjust.error) ||
       activeUsage.error ||
       activeAccessKeys.error
     );
@@ -1221,6 +1223,16 @@
     }
   }
 
+  function formatCredentialWeight(cred) {
+    const wMin = toFiniteNum(cred.weight_min);
+    const wMax = toFiniteNum(cred.weight_max);
+    if (wMin !== null && wMax !== null && wMin !== wMax) {
+      return `${formatInt(wMin)}–${formatInt(wMax)}`;
+    }
+    const w = toFiniteNum(cred.weight);
+    return w !== null ? formatInt(w) : "—";
+  }
+
   function renderQuotaSection() {
     const quotaState = state.sections.quota;
     const sectionEl = byId("section-quota");
@@ -1241,6 +1253,11 @@
           : `订阅额度获取失败：${quotaState.error}`
         : null
     );
+    const wa = state.weightAdjust;
+    setAlert(
+      byId("quota-weight-error"),
+      wa && wa.error ? `自动调权异常：${wa.error}` : null
+    );
 
     const data = quotaState.data;
     const items = data && Array.isArray(data.items) ? data.items : [];
@@ -1253,6 +1270,13 @@
       }
       if (data && toFiniteNum(data.observed_at_ms)) {
         parts.push(`上游观测 ${formatLocalDateTime(data.observed_at_ms)}`);
+      }
+      if (wa && wa.enabled) {
+        if (toFiniteNum(wa.last_run_at_ms)) {
+          parts.push(`调权 ${formatLocalDateTime(wa.last_run_at_ms)}`);
+        } else {
+          parts.push("自动调权已启用");
+        }
       }
       metaEl.textContent = parts.length > 0 ? parts.join("  |  ") : (state.isLoading ? "加载中…" : "暂无更新时间");
     }
@@ -1320,6 +1344,10 @@
         createEl("div", { className: "quota-meta-pair" }, [
           createEl("dt", { text: "可用分组" }),
           createEl("dd", { className: "measured", text: groupRatioText }),
+        ]),
+        createEl("div", { className: "quota-meta-pair" }, [
+          createEl("dt", { text: "当前权重" }),
+          createEl("dd", { className: "measured", text: formatCredentialWeight(cred) }),
         ]),
         createEl("div", { className: "quota-meta-pair" }, [
           createEl("dt", { text: "上游观测" }),
@@ -2583,6 +2611,7 @@
       applySectionPayload(state.sections.health, body.health, nowMs);
       applySectionPayload(state.sections.concurrency, body.concurrency, nowMs);
       applySectionPayload(state.sections.quota, body.quota, nowMs);
+      state.weightAdjust = body.weight_adjust && typeof body.weight_adjust === "object" ? body.weight_adjust : null;
 
       expireCalendarCache(requestedRange);
       const usageBucket = state.usageByRange[requestedRange];
